@@ -65,7 +65,7 @@ int load_smd_rom(long filesize, FILE * f, void **buffer)
 	return rom_size;
 }
 
-uint32_t load_rom(char * filename, void **dst, system_type *stype)
+uint32_t load_media(char * filename, system_media *dst, system_type *stype)
 {
 	uint8_t header[10];
 	FILE * f = fopen(filename, "rb");
@@ -78,6 +78,7 @@ uint32_t load_rom(char * filename, void **dst, system_type *stype)
 	fseek(f, 0, SEEK_END);
 	long filesize = ftell(f);
 	fseek(f, 0, SEEK_SET);
+	uint32_t ret = 0;
 	if (header[1] == SMD_MAGIC1 && header[8] == SMD_MAGIC2 && header[9] == SMD_MAGIC3) {
 		int i;
 		for (i = 3; i < 8; i++) {
@@ -92,15 +93,22 @@ uint32_t load_rom(char * filename, void **dst, system_type *stype)
 			if (stype) {
 				*stype = SYSTEM_GENESIS;
 			}
-			return load_smd_rom(filesize, f, dst);
+			ret = load_smd_rom(filesize, f, &dst->buffer);
 		}
 	}
-	*dst = malloc(nearest_pow2(filesize));
-	if (filesize != fread(*dst, 1, filesize, f)) {
-		fatal_error("Error reading from %s\n", filename);
+	if (!ret) {
+		dst->buffer = malloc(nearest_pow2(filesize));
+		if (filesize != fread(dst->buffer, 1, filesize, f)) {
+			fatal_error("Error reading from %s\n", filename);
+		}
+		ret = filesize;
 	}
+	dst->dir = path_dirname(filename);
+	dst->name = basename_no_extension(filename);
+	dst->extension = path_extension(filename);
+	dst->size = ret;
 	fclose(f);
-	return filesize;
+	return ret;
 }
 
 
@@ -228,10 +236,7 @@ void lockon_media(char *lock_on_path)
 	free(lock_on.dir);
 	free(lock_on.name);
 	free(lock_on.extension);
-	lock_on.dir = path_dirname(lock_on_path);
-	lock_on.name = basename_no_extension(lock_on_path);
-	lock_on.extension = path_extension(lock_on_path);
-	lock_on.size = load_rom(lock_on_path, &lock_on.buffer, NULL);
+	load_media(lock_on_path, &lock_on, NULL);
 }
 
 int main(int argc, char ** argv)
@@ -333,12 +338,9 @@ int main(int argc, char ** argv)
 				if (i >= argc) {
 					fatal_error("-o must be followed by a lock on cartridge filename\n");
 				}
-				lock_on.size = load_rom(argv[i], &lock_on.buffer, NULL);
-				if (!lock_on.size) {
+				if (!load_media(argv[i], &lock_on, NULL)) {
 					fatal_error("Failed to load lock on cartridge %s\n", argv[i]);
 				}
-				lock_on.name = basename_no_extension(argv[i]);
-				lock_on.extension = path_extension(argv[i]);
 				cart.chain = &lock_on;
 				break;
 			}
@@ -367,12 +369,9 @@ int main(int argc, char ** argv)
 				fatal_error("Unrecognized switch %s\n", argv[i]);
 			}
 		} else if (!loaded) {
-			if (!(cart.size = load_rom(argv[i], &cart.buffer, stype == SYSTEM_UNKNOWN ? &stype : NULL))) {
+			if (!load_media(argv[i], &cart, stype == SYSTEM_UNKNOWN ? &stype : NULL)) {
 				fatal_error("Failed to open %s for reading\n", argv[i]);
 			}
-			cart.dir = path_dirname(argv[i]);
-			cart.name = basename_no_extension(argv[i]);
-			cart.extension = path_extension(argv[i]);
 			romfname = argv[i];
 			loaded = 1;
 		} else if (width < 0) {
@@ -389,7 +388,7 @@ int main(int argc, char ** argv)
 			romfname = "menu.bin";
 		}
 		if (is_absolute_path(romfname)) {
-			if (!(cart.size = load_rom(romfname, &cart.buffer, &stype))) {
+			if (!load_media(romfname, &cart, &stype)) {
 				fatal_error("Failed to open UI ROM %s for reading", romfname);
 			}
 		} else {
@@ -402,12 +401,12 @@ int main(int argc, char ** argv)
 				cart.buffer = realloc(cart.buffer, rom_size);
 				cart.size = rom_size;
 			}
+			cart.dir = path_dirname(romfname);
+			cart.name = basename_no_extension(romfname);
+			cart.extension = path_extension(romfname);
 		}
 		//force system detection, value on command line is only for games not the menu
 		stype = detect_system_type(&cart);
-		cart.dir = path_dirname(romfname);
-		cart.name = basename_no_extension(romfname);
-		cart.extension = path_extension(romfname);
 		loaded = 1;
 	}
 	
@@ -486,15 +485,12 @@ int main(int argc, char ** argv)
 				//start a new arena and save old one in suspended genesis context
 				current_system->arena = start_new_arena();
 			}
-			if (!(cart.size = load_rom(next_rom, &cart.buffer, &stype))) {
-				fatal_error("Failed to open %s for reading\n", next_rom);
-			}
 			free(cart.dir);
 			free(cart.name);
 			free(cart.extension);
-			cart.dir = path_dirname(next_rom);
-			cart.name = basename_no_extension(next_rom);
-			cart.extension = path_extension(next_rom);
+			if (!load_media(next_rom, &cart, &stype)) {
+				fatal_error("Failed to open %s for reading\n", next_rom);
+			}
 			stype = force_stype;
 			if (stype == SYSTEM_UNKNOWN) {
 				stype = detect_system_type(&cart);

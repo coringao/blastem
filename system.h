@@ -8,6 +8,7 @@ typedef struct system_media system_media;
 typedef enum {
 	SYSTEM_UNKNOWN,
 	SYSTEM_GENESIS,
+	SYSTEM_SEGACD,
 	SYSTEM_SMS,
 	SYSTEM_JAGUAR
 } system_type;
@@ -51,6 +52,11 @@ struct system_header {
 	system_type       type;
 };
 
+typedef enum {
+	MEDIA_CART,
+	MEDIA_CDROM
+} media_type;
+
 struct system_media {
 	void         *buffer;
 	char         *dir;
@@ -58,6 +64,7 @@ struct system_media {
 	char         *extension;
 	system_media *chain;
 	uint32_t     size;
+	media_type   type;
 };
 
 #define OPT_ADDRESS_LOG (1U << 31U)
