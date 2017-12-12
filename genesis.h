@@ -31,6 +31,7 @@ struct genesis_context {
 	uint16_t        *lock_on;
 	uint16_t        *work_ram;
 	uint8_t         *zram;
+	void            *expansion;
 	void            *extra;
 	uint8_t         *save_storage;
 	void            *mapper_temp;
