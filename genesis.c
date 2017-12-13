@@ -4,6 +4,7 @@
  BlastEm is free software distributed under the terms of the GNU General Public License version 3 or greater. See COPYING for full license text.
 */
 #include "genesis.h"
+#include "segacd.h"
 #include "blastem.h"
 #include "nor.h"
 #include <stdlib.h>
@@ -1086,7 +1087,8 @@ static void start_genesis(system_header *system, char *statefile)
 	} else {
 		if (gen->header.enter_debugger) {
 			gen->header.enter_debugger = 0;
-			uint32_t address = gen->cart[2] << 16 | gen->cart[3];
+			uint32_t address = read_word(4, (void **)gen->m68k->mem_pointers, &gen->m68k->options->gen, gen->m68k) << 16
+				| read_word(6, (void **)gen->m68k->mem_pointers, &gen->m68k->options->gen, gen->m68k);
 			insert_breakpoint(gen->m68k, address, gen->header.debugger_type == DEBUGGER_NATIVE ? debugger : gdb_debug_enter);
 		}
 		m68k_reset(gen->m68k);
@@ -1184,7 +1186,7 @@ static void free_genesis(system_header *system)
 	free(gen);
 }
 
-genesis_context *alloc_init_genesis(rom_info *rom, void *main_rom, void *lock_on, uint32_t system_opts, uint8_t force_region)
+static genesis_context *shared_init(uint32_t system_opts, rom_info *rom, uint8_t force_region)
 {
 	static memmap_chunk z80_map[] = {
 		{ 0x0000, 0x4000,  0x1FFF, 0, 0, MMAP_READ | MMAP_WRITE | MMAP_CODE, NULL, NULL, NULL, NULL,              NULL },
@@ -1193,6 +1195,16 @@ genesis_context *alloc_init_genesis(rom_info *rom, void *main_rom, void *lock_on
 		{ 0x6000, 0x6100,  0xFFFF, 0, 0, 0,                                  NULL, NULL, NULL, NULL,              z80_write_bank_reg},
 		{ 0x7F00, 0x8000,  0x00FF, 0, 0, 0,                                  NULL, NULL, NULL, z80_vdp_port_read, z80_vdp_port_write}
 	};
+	
+	char *m68k_divider = tern_find_path(config, "clocks\0m68k_divider\0", TVAL_PTR).ptrval;
+	if (!m68k_divider) {
+		m68k_divider = "7";
+	}
+	MCLKS_PER_68K = atoi(m68k_divider);
+	if (!MCLKS_PER_68K) {
+		MCLKS_PER_68K = 7;
+	}
+	
 	genesis_context *gen = calloc(1, sizeof(genesis_context));
 	gen->header.set_speed_percent = set_speed_percent;
 	gen->header.start_context = start_genesis;
@@ -1207,8 +1219,9 @@ genesis_context *alloc_init_genesis(rom_info *rom, void *main_rom, void *lock_on
 	gen->header.inc_debug_mode = inc_debug_mode;
 	gen->header.inc_debug_pal = inc_debug_pal;
 	gen->header.type = SYSTEM_GENESIS;
+	
 	set_region(gen, rom, force_region);
-
+	
 	gen->vdp = malloc(sizeof(vdp_context));
 	init_vdp_context(gen->vdp, gen->version_reg & 0x40);
 	gen->vdp->system = &gen->header;
@@ -1217,7 +1230,7 @@ genesis_context *alloc_init_genesis(rom_info *rom, void *main_rom, void *lock_on
 	gen->max_cycles = config_cycles ? atoi(config_cycles) : DEFAULT_SYNC_INTERVAL;
 	gen->int_latency_prev1 = MCLKS_PER_68K * 32;
 	gen->int_latency_prev2 = MCLKS_PER_68K * 16;
-
+	
 	char * lowpass_cutoff_str = tern_find_path(config, "audio\0lowpass_cutoff\0", TVAL_PTR).ptrval;
 	uint32_t lowpass_cutoff = lowpass_cutoff_str ? atoi(lowpass_cutoff_str) : DEFAULT_LOWPASS_CUTOFF;
 	
@@ -1241,10 +1254,8 @@ genesis_context *alloc_init_genesis(rom_info *rom, void *main_rom, void *lock_on
 
 	gen->z80->system = gen;
 	gen->z80->mem_pointers[0] = gen->zram;
-	gen->z80->mem_pointers[1] = gen->z80->mem_pointers[2] = (uint8_t *)main_rom;
-
-	gen->cart = main_rom;
-	gen->lock_on = lock_on;
+	gen->z80->mem_pointers[1] = gen->z80->mem_pointers[2] = NULL;
+	
 	gen->work_ram = calloc(2, RAM_WORDS);
 	if (!strcmp("random", tern_find_path_default(config, "system\0ram_init\0", (tern_val){.ptrval = "zero"}, TVAL_PTR).ptrval))
 	{
@@ -1274,8 +1285,19 @@ genesis_context *alloc_init_genesis(rom_info *rom, void *main_rom, void *lock_on
 			gen->vdp->vsram[i] = rand();
 		}
 	}
-	setup_io_devices(config, rom, &gen->io);
+	
+	return gen;
+}
 
+genesis_context *alloc_init_genesis(rom_info *rom, void *main_rom, void *lock_on, uint32_t system_opts, uint8_t force_region)
+{
+	genesis_context *gen = shared_init(system_opts, rom, force_region);
+	gen->z80->mem_pointers[1] = gen->z80->mem_pointers[2] = (uint8_t *)main_rom;
+
+	gen->cart = main_rom;
+	gen->lock_on = lock_on;
+	
+	setup_io_devices(config, rom, &gen->io);
 	gen->mapper_type = rom->mapper_type;
 	gen->save_type = rom->save_type;
 	if (gen->save_type != SAVE_NONE) {
@@ -1329,23 +1351,22 @@ genesis_context *alloc_init_genesis(rom_info *rom, void *main_rom, void *lock_on
 	return gen;
 }
 
+static memmap_chunk base_map[] = {
+	{0xE00000, 0x1000000, 0xFFFF,   0, 0, MMAP_READ | MMAP_WRITE | MMAP_CODE, NULL,
+			   NULL,          NULL,         NULL,            NULL},
+	{0xC00000, 0xE00000,  0x1FFFFF, 0, 0, 0,                                  NULL,
+			   (read_16_fun)vdp_port_read,  (write_16_fun)vdp_port_write,
+			   (read_8_fun)vdp_port_read_b, (write_8_fun)vdp_port_write_b},
+	{0xA00000, 0xA12000,  0x1FFFF,  0, 0, 0,                                  NULL,
+			   (read_16_fun)io_read_w,      (write_16_fun)io_write_w,
+			   (read_8_fun)io_read,         (write_8_fun)io_write}
+};
+const size_t base_chunks = sizeof(base_map)/sizeof(*base_map); 
+
 genesis_context *alloc_config_genesis(void *rom, uint32_t rom_size, void *lock_on, uint32_t lock_on_size, uint32_t ym_opts, uint8_t force_region, rom_info *info_out)
 {
-	static memmap_chunk base_map[] = {
-		{0xE00000, 0x1000000, 0xFFFF,   0, 0, MMAP_READ | MMAP_WRITE | MMAP_CODE, NULL,
-		           NULL,          NULL,         NULL,            NULL},
-		{0xC00000, 0xE00000,  0x1FFFFF, 0, 0, 0,                                  NULL,
-		           (read_16_fun)vdp_port_read,  (write_16_fun)vdp_port_write,
-		           (read_8_fun)vdp_port_read_b, (write_8_fun)vdp_port_write_b},
-		{0xA00000, 0xA12000,  0x1FFFF,  0, 0, 0,                                  NULL,
-		           (read_16_fun)io_read_w,      (write_16_fun)io_write_w,
-		           (read_8_fun)io_read,         (write_8_fun)io_write}
-	};
-	static tern_node *rom_db;
-	if (!rom_db) {
-		rom_db = load_rom_db();
-	}
-	*info_out = configure_rom(rom_db, rom, rom_size, lock_on, lock_on_size, base_map, sizeof(base_map)/sizeof(base_map[0]));
+	tern_node *rom_db = get_rom_db();
+	*info_out = configure_rom(rom_db, rom, rom_size, lock_on, lock_on_size, base_map, base_chunks);
 	rom = info_out->rom;
 	rom_size = info_out->rom_size;
 #ifndef BLASTEM_BIG_ENDIAN
@@ -1354,13 +1375,43 @@ genesis_context *alloc_config_genesis(void *rom, uint32_t rom_size, void *lock_o
 		byteswap_rom(lock_on_size, lock_on);
 	}
 #endif
-	char *m68k_divider = tern_find_path(config, "clocks\0m68k_divider\0", TVAL_PTR).ptrval;
-	if (!m68k_divider) {
-		m68k_divider = "7";
-	}
-	MCLKS_PER_68K = atoi(m68k_divider);
-	if (!MCLKS_PER_68K) {
-		MCLKS_PER_68K = 7;
-	}
 	return alloc_init_genesis(info_out, rom, lock_on, ym_opts, force_region);
+}
+
+genesis_context *alloc_config_genesis_cdboot(system_media *media, uint32_t system_opts, uint8_t force_region, rom_info *info_out)
+{
+	segacd_context *cd = alloc_configure_segacd(media, system_opts, force_region, info_out);
+	genesis_context *gen = shared_init(system_opts, info_out, force_region);
+	gen->cart = gen->lock_on = NULL;
+	gen->save_storage = NULL;
+	gen->save_type = SAVE_NONE;
+	gen->version_reg &= ~NO_DISK;
+	
+	gen->expansion = cd;
+	setup_io_devices(config, info_out, &gen->io);
+	
+	uint32_t cd_chunks;
+	memmap_chunk *cd_map = segacd_main_cpu_map(gen->expansion, &cd_chunks);
+	memmap_chunk *map = malloc(sizeof(memmap_chunk) * (cd_chunks + base_chunks));
+	memcpy(map, cd_map, sizeof(memmap_chunk) * cd_chunks);
+	memcpy(map + cd_chunks, base_map, sizeof(memmap_chunk) * base_chunks);
+	map[cd_chunks].buffer = gen->work_ram;
+	uint32_t num_chunks = cd_chunks + base_chunks;
+	
+	m68k_options *opts = malloc(sizeof(m68k_options));
+	init_m68k_opts(opts, map, num_chunks, MCLKS_PER_68K);
+	//TODO: make this configurable
+	opts->gen.flags |= M68K_OPT_BROKEN_READ_MODIFY;
+	gen->m68k = init_68k_context(opts, NULL);
+	gen->m68k->system = gen;
+	opts->address_log = (system_opts & OPT_ADDRESS_LOG) ? fopen("address.log", "w") : NULL;
+	
+	//This must happen after the 68K context has been allocated
+	for (int i = 0; i < num_chunks; i++)
+	{
+		if (map[i].flags & MMAP_PTR_IDX) {
+			gen->m68k->mem_pointers[map[i].ptr_index] = map[i].buffer;
+		}
+	}
+	return gen;
 }

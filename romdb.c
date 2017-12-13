@@ -33,11 +33,14 @@ char const *save_type_name(uint8_t save_type)
 	return "SRAM";
 }
 
-tern_node *load_rom_db()
+tern_node *get_rom_db()
 {
-	tern_node *db = parse_bundled_config("rom.db");
+	static tern_node *db;
 	if (!db) {
-		fatal_error("Failed to load ROM DB\n");
+		db = parse_bundled_config("rom.db");
+		if (!db) {
+			fatal_error("Failed to load ROM DB\n");
+		}
 	}
 	return db;
 }

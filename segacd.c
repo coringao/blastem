@@ -203,6 +203,7 @@ segacd_context *alloc_configure_segacd(system_media *media, uint32_t opts, uint8
 		{0xFF0000, 0xFF7FFF, 0x0000, .read_16 = pcm_read16, .write_16 = pcm_write16, .read_8 = pcm_read8, .write_8 = pcm_write8},
 		{0xFF8000, 0xFF81FF, 0x0000, .read_16 = sub_gate_read16, .write_16 = sub_gate_write16, .read_8 = sub_gate_read8, .write_8 = sub_gate_write8}
 	};
+	memset(info, 0, sizeof(*info));
 	segacd_context *cd = calloc(sizeof(segacd_context), 1);
 	FILE *f = fopen("cdbios.bin", "rb");
 	if (!f) {
@@ -215,8 +216,12 @@ segacd_context *alloc_configure_segacd(system_media *media, uint32_t opts, uint8
 		fatal_error("Failed to read CD firmware");
 	}
 	cd->rom_mut = malloc(adjusted_size);
+	byteswap_rom(adjusted_size, cd->rom);
 	memcpy(cd->rom_mut, cd->rom, adjusted_size);
-	byteswap_rom(firmware_size, cd->rom);
+	
+	tern_node *db = get_rom_db();
+	*info = configure_rom(db, media->buffer, media->size, media->chain ? media->chain->buffer : NULL, media->chain ? media->chain->size : 0, NULL, 0);
+	
 	cd->prog_ram = malloc(512*1024);
 	cd->work_ram = malloc(256*1024);
 	cd->pcm_ram = malloc(64*1024);
@@ -238,7 +243,7 @@ segacd_context *alloc_configure_segacd(system_media *media, uint32_t opts, uint8
 memmap_chunk *segacd_main_cpu_map(segacd_context *cd, uint32_t *num_chunks)
 {
 	static memmap_chunk main_cpu_map[] = {
-		{0x000000, 0x01FFFF, 0x00000, .flags=MMAP_READ},
+		{0x000000, 0x01FFFF, 0xFFFFFF, .flags=MMAP_READ},
 		{0x020000, 0x03FFFF, 0x1FFFF, .flags=MMAP_READ|MMAP_WRITE|MMAP_PTR_IDX|MMAP_FUNC_NULL, .ptr_index = 0},//TODO: support running main CPU code from here
 		{0x040000, 0x05FFFF, 0x1FFFF, .flags=MMAP_READ}, //first ROM alias
 		//TODO: additional ROM/prog RAM aliases
