@@ -249,6 +249,7 @@ memmap_chunk *segacd_main_cpu_map(segacd_context *cd, uint32_t *num_chunks)
 		//TODO: additional ROM/prog RAM aliases
 		{0x200000, 0x01FFFF, 0x1FFFF, .flags=MMAP_READ|MMAP_WRITE|MMAP_PTR_IDX|MMAP_FUNC_NULL, .ptr_index = 1},
 		{0x220000, 0x03FFFF, 0x1FFFF, .flags=MMAP_READ|MMAP_WRITE|MMAP_PTR_IDX|MMAP_FUNC_NULL, .ptr_index = 2},
+		{0xA12000, 0xA12FFF, 0xFFFFFF, .read_16 = main_gate_read16, .write_16 = main_gate_write16, .read_8 = main_gate_read8, .write_8 = main_gate_write8}
 	};
 	//TODO: support cart boot maps
 	//TODO: support BRAM cart
