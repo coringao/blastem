@@ -277,7 +277,7 @@ static void sync_sound(genesis_context * gen, uint32_t target)
 static uint32_t last_frame_num;
 
 //My refresh emulation isn't currently good enough and causes more problems than it solves
-#define REFRESH_EMULATION
+//#define REFRESH_EMULATION
 #ifdef REFRESH_EMULATION
 #define REFRESH_INTERVAL 128
 #define REFRESH_DELAY 2

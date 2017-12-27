@@ -10,6 +10,7 @@
 #include "gen.h"
 #include "util.h"
 #include "serialize.h"
+#include "musashi/m68kcpu.h"
 #include <stdio.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -1169,24 +1170,45 @@ void start_68k_context(m68k_context * context, uint32_t address)
 	code_ptr addr = get_native_address_trans(context, address);
 	m68k_options * options = context->options;
 	context->should_return = 0;
+#ifdef USE_NATIVE
 	options->start_context(addr, context);
+#else
+	while (!context->should_return) {
+		if (context->current_cycle >= context->target_cycle) {
+			context->target_cycle += 4 * options->gen.clock_divider;
+		}
+		m68k_cpu_execute((m68000_base_device *)context);
+		if (!context->should_return) {
+			sync_components(context, 0);
+		}
+	}
+#endif
 }
 
 void resume_68k(m68k_context *context)
 {
+#ifdef USE_NATIVE
 	code_ptr addr = context->resume_pc;
 	context->resume_pc = NULL;
 	m68k_options * options = context->options;
 	context->should_return = 0;
 	options->start_context(addr, context);
+#else
+	start_68k_context(context, 0);
+#endif
 }
 
 void m68k_reset(m68k_context * context)
 {
+#ifdef USE_NATIVE
 	//TODO: Actually execute the M68K reset vector rather than simulating some of its behavior
 	uint16_t *reset_vec = get_native_pointer(0, (void **)context->mem_pointers, &context->options->gen);
 	context->aregs[7] = reset_vec[0] << 16 | reset_vec[1];
 	uint32_t address = reset_vec[2] << 16 | reset_vec[3];
+#else
+	m68k_reset_cpu((m68000_base_device *)context);
+	uint32_t address = 0;
+#endif
 	start_68k_context(context, address);
 }
 
@@ -1200,10 +1222,19 @@ void m68k_options_free(m68k_options *opts)
 
 m68k_context * init_68k_context(m68k_options * opts, m68k_reset_handler reset_handler)
 {
+#ifdef USE_NATIVE
 	size_t ctx_size = sizeof(m68k_context) + ram_size(&opts->gen) / (1 << opts->gen.ram_flags_shift) / 8;
 	m68k_context * context = malloc(ctx_size);
 	memset(context, 0, ctx_size);
 	context->options = opts;
+#else
+	m68000_base_device *device = malloc(sizeof(m68000_base_device));;
+	memset(device, 0, sizeof(m68000_base_device));
+	m68k_context *context = &device->c;
+	context->options = opts;
+	m68k_init_cpu_m68000(device);
+	
+#endif
 	context->int_cycle = CYCLE_NEVER;
 	context->status = 0x27;
 	context->reset_handler = (code_ptr)reset_handler;
