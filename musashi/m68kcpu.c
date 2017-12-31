@@ -773,11 +773,24 @@ void m68k_reset_cpu(m68000_base_device *this)
 
 uint8_t m68ki_read_8(m68000_base_device *m68k, uint32_t address)
 {
+	address &= 0xFFFFFF;
+	uint32_t base = address >> 16;
+	if (m68k->read_pointers[base]) {
+		uint8_t *chunk = m68k->read_pointers[base];
+		return chunk[(address ^ 1) & 0xFFFF];
+	}
 	return read_byte(address, (void **)m68k->c.mem_pointers, &m68k->c.options->gen, &m68k->c);
 }
 
 void m68ki_write_8(m68000_base_device *m68k, uint32_t address, uint8_t value)
 {
+	address &= 0xFFFFFF;
+	uint32_t base = address >> 16;
+	if (m68k->read_pointers[base]) {
+		uint8_t *chunk = m68k->read_pointers[base];
+		chunk[(address ^ 1) & 0xFFFF] = value;
+		return;
+	}
 	write_byte(address, value, (void **)m68k->c.mem_pointers, &m68k->c.options->gen, &m68k->c);
 }
 
@@ -787,11 +800,24 @@ void m68ki_write_8(m68000_base_device *m68k, uint32_t address, uint8_t value)
  
 uint16_t m68ki_read_16(m68000_base_device *m68k, uint32_t address)
 {
+	address &= 0xFFFFFF;
+	uint32_t base = address >> 16;
+	if (m68k->read_pointers[base]) {
+		uint16_t *chunk = m68k->read_pointers[base];
+		return chunk[address >> 1 & 0x7FFF];
+	}
 	return read_word(address, (void **)m68k->c.mem_pointers, &m68k->c.options->gen, &m68k->c);
 }
 
 void m68ki_write_16(m68000_base_device *m68k, uint32_t address, uint16_t value)
 {
+	address &= 0xFFFFFF;
+	uint32_t base = address >> 16;
+	if (m68k->write_pointers[base]) {
+		uint16_t *chunk = m68k->read_pointers[base];
+		chunk[address >> 1 & 0x7FFF] = value;
+		return;
+	}
 	write_word(address, value, (void **)m68k->c.mem_pointers, &m68k->c.options->gen, &m68k->c);
 }
 
@@ -833,6 +859,25 @@ void m68k_init_cpu_m68000(m68000_base_device *this)
 	this->cyc_reset        = 132 * this->c.options->gen.clock_divider;
 	this->int_mask = 7 << 8;
 	this->c.status = m68ki_get_sr(this) >> 8;
+	for (uint32_t address = 0; address < (24*1024*1024); address += 64*1024)
+	{
+		this->read_pointers[address >> 16] = NULL;
+		this->write_pointers[address >> 16] = NULL;
+		memmap_chunk const *chunk = find_map_chunk(address, &this->c.options->gen, 0, NULL);
+		if (!chunk || chunk->end < (address + 64*1024) || (chunk->flags & (MMAP_ONLY_ODD | MMAP_ONLY_EVEN | MMAP_PTR_IDX)) || !chunk->buffer) {
+			continue;
+		}
+		void *ptr = get_native_pointer(address, (void **)this->c.mem_pointers, &this->c.options->gen);
+		if (!ptr) {
+			continue;
+		}
+		if (chunk->flags & MMAP_READ) {
+			this->read_pointers[address >> 16] = ptr;
+		}
+		if (chunk->flags & MMAP_WRITE) {
+			this->write_pointers[address >> 16] = ptr;
+		}
+	}
 }
 
 /* Service an interrupt request and start exception processing */

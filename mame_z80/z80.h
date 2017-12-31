@@ -94,6 +94,8 @@ struct z80_device
 	const uint8_t *   m_cc_xy;
 	const uint8_t *   m_cc_xycb;
 	const uint8_t *   m_cc_ex;
+	uint8_t           *read_pointers[64/8];
+	uint8_t           *write_pointers[64/8];
 };
 
 #define z80_invalidate_code_range(Z, S, E) 

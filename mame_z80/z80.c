@@ -450,6 +450,10 @@ static inline void out(z80_device *z80, uint16_t port, uint8_t value)
  ***************************************************************/
 static inline uint8_t rm(z80_device *z80, uint16_t addr)
 {
+	uint16_t index = addr >> 13;
+	if (z80->read_pointers[index]) {
+		return z80->read_pointers[index][addr & 0x1FFF];
+	}
 	return read_byte(addr, (void **)z80->mem_pointers, &z80->options->gen, z80);
 }
 
@@ -467,6 +471,11 @@ static inline void rm16(z80_device *z80, uint16_t addr, PAIR *r)
  ***************************************************************/
 static inline void wm(z80_device *z80, uint16_t addr, uint8_t value)
 {
+	uint16_t index = addr >> 13;
+	if (z80->write_pointers[index]) {
+		z80->write_pointers[index][addr & 0x1FFF] = value;
+		return;
+	}
 	write_byte(addr, value, (void **)z80->mem_pointers, &z80->options->gen, z80);
 }
 
@@ -3438,6 +3447,26 @@ z80_context *init_z80_context(z80_options *opts)
 	z80->m_cc_xy = cc_xy;
 	z80->m_cc_xycb = cc_xycb;
 	z80->m_cc_ex = cc_ex;
+	
+	for (uint32_t address = 0; address < (64*1024); address += 8*1024)
+	{
+		z80->read_pointers[address >> 13] = NULL;
+		z80->write_pointers[address >> 13] = NULL;
+		memmap_chunk const *chunk = find_map_chunk(address, &z80->options->gen, 0, NULL);
+		if (!chunk || chunk->end < (address + 8*1024) || (chunk->flags & MMAP_PTR_IDX) || !chunk->buffer) {
+			continue;
+		}
+		void *ptr = get_native_pointer(address, (void **)z80->mem_pointers, &z80->options->gen);
+		if (!ptr) {
+			continue;
+		}
+		if (chunk->flags & MMAP_READ) {
+			z80->read_pointers[address >> 13] = ptr;
+		}
+		if (chunk->flags & MMAP_WRITE) {
+			z80->write_pointers[address >> 13] = ptr;
+		}
+	}
 	
 	return z80;
 }

@@ -55,6 +55,8 @@ struct m68000_base_device {
 	void (**jump_table)(m68000_base_device *m68k);
 	const uint8_t* cyc_instruction;
 	const uint8_t* cyc_exception;
+	void *read_pointers[24*1024/64];
+	void *write_pointers[24*1024/64];
 };
 
 /* Special interrupt acknowledge values.
