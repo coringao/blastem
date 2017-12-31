@@ -4,7 +4,11 @@
 #include <string.h>
 #include <sys/select.h>
 
+#ifdef USE_NATIVE
 #include "z80_to_x86.h"
+#else
+#include "mame_z80/z80.h"
+#endif
 #include "util.h"
 
 uint8_t ram[64 * 1024];

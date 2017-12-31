@@ -4,7 +4,11 @@
 #include "system.h"
 #include "vdp.h"
 #include "psg.h"
+#ifdef USE_NATIVE
 #include "z80_to_x86.h"
+#else
+#include "mame_z80/z80.h"
+#endif
 #include "io.h"
 
 #define SMS_RAM_SIZE (8*1024)

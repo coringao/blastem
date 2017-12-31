@@ -708,7 +708,7 @@ void m68k_cpu_execute(m68000_base_device *this)
 
 
 			/* Trace m68k_exception, if necessary */
-			//m68ki_exception_if_trace(this); /* auto-disable (see m68kcpu.h) */
+			m68ki_exception_if_trace(this); /* auto-disable (see m68kcpu.h) */
 		}
 
 		/* set previous PC to current PC for the next entry into the loop */
@@ -860,10 +860,12 @@ void m68ki_exception_interrupt(m68000_base_device *this, uint32_t int_level)
 	vector = M68K_INT_ACK_AUTOVECTOR;//int_ack_callback(*this, int_level);
 
 	/* Get the interrupt vector */
-	if(vector == M68K_INT_ACK_AUTOVECTOR)
+	if(vector == M68K_INT_ACK_AUTOVECTOR) {
 		/* Use the autovectors.  This is the most commonly used implementation */
 		vector = EXCEPTION_INTERRUPT_AUTOVECTOR+int_level;
-	else if(vector == M68K_INT_ACK_SPURIOUS)
+		uint32_t e_clock = this->c.current_cycle / this->c.options->gen.clock_divider;
+		this->c.current_cycle += ((9-4) + e_clock % 10) * this->c.options->gen.clock_divider;
+	} else if(vector == M68K_INT_ACK_SPURIOUS)
 		/* Called if no devices respond to the interrupt acknowledge */
 		vector = EXCEPTION_SPURIOUS_INTERRUPT;
 	else if(vector > 255)

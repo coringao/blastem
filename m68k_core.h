@@ -36,11 +36,13 @@ typedef struct {
 
 typedef struct {
 	cpu_options     gen;
-
+#ifdef USE_NATIVE
 	int8_t          dregs[8];
 	int8_t          aregs[8];
 	int8_t			flag_regs[5];
+#endif
 	FILE            *address_log;
+#ifdef USE_NATIVE
 	code_ptr        read_16;
 	code_ptr        write_16;
 	code_ptr        read_8;
@@ -64,6 +66,7 @@ typedef struct {
 	uint32_t        num_movem;
 	uint32_t        movem_storage;
 	code_word       prologue_start;
+#endif
 } m68k_options;
 
 typedef struct m68k_context m68k_context;
@@ -112,11 +115,16 @@ void m68k_reset(m68k_context * context);
 void m68k_options_free(m68k_options *opts);
 void insert_breakpoint(m68k_context * context, uint32_t address, m68k_debug_handler bp_handler);
 void remove_breakpoint(m68k_context * context, uint32_t address);
-m68k_context * m68k_handle_code_write(uint32_t address, m68k_context * context);
 uint32_t get_instruction_start(m68k_options *opts, uint32_t address);
 uint16_t m68k_get_ir(m68k_context *context);
 void m68k_print_regs(m68k_context * context);
+#ifdef USE_NATIVE
+m68k_context * m68k_handle_code_write(uint32_t address, m68k_context * context);
 void m68k_invalidate_code_range(m68k_context *context, uint32_t start, uint32_t end);
+#else
+#define m68k_handle_code_write(A, M)
+#define m68k_invalidate_code_range(M, S, E)
+#endif
 void m68k_serialize(m68k_context *context, uint32_t pc, serialize_buffer *buf);
 void m68k_deserialize(deserialize_buffer *buf, void *vcontext);
 

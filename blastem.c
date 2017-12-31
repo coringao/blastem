@@ -11,7 +11,11 @@
 #include "system.h"
 #include "68kinst.h"
 #include "m68k_core.h"
+#ifdef USE_NATIVE
 #include "z80_to_x86.h"
+#else
+#include "mame_z80/z80.h"
+#endif
 #include "mem.h"
 #include "vdp.h"
 #include "render.h"
@@ -269,11 +273,13 @@ int main(int argc, char ** argv)
 					debug_target = 1;
 				}
 				break;
+#ifdef USE_NATIVE
 			case 'D':
 				gdb_remote_init();
 				dtype = DEBUGGER_GDB;
 				start_in_debugger = 1;
 				break;
+#endif
 			case 'f':
 				fullscreen = !fullscreen;
 				break;
@@ -476,15 +482,19 @@ int main(int argc, char ** argv)
 			current_system->next_rom = NULL;
 			if (game_system) {
 				game_system->persist_save(game_system);
+#ifdef USE_NATIVE
 				//swap to game context arena and mark all allocated pages in it free
 				if (menu) {
 					current_system->arena = set_current_arena(game_system->arena);
 				}
 				mark_all_free();
+#endif
 				game_system->free_context(game_system);
 			} else {
+#ifdef USE_NATIVE
 				//start a new arena and save old one in suspended genesis context
 				current_system->arena = start_new_arena();
+#endif
 			}
 			if (!(cart.size = load_rom(next_rom, &cart.buffer, &stype))) {
 				fatal_error("Failed to open %s for reading\n", next_rom);
@@ -520,12 +530,16 @@ int main(int argc, char ** argv)
 			current_system->enter_debugger = start_in_debugger && menu == debug_target;
 			current_system->start_context(current_system, statefile);
 		} else if (menu && game_system) {
+#ifdef USE_NATIVE
 			current_system->arena = set_current_arena(game_system->arena);
+#endif
 			current_system = game_system;
 			menu = 0;
 			current_system->resume_context(current_system);
 		} else if (!menu && menu_system) {
+#ifdef USE_NATIVE
 			current_system->arena = set_current_arena(menu_system->arena);
+#endif
 			current_system = menu_system;
 			menu = 1;
 			current_system->resume_context(current_system);

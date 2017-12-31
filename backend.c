@@ -6,6 +6,7 @@
 #include "backend.h"
 #include <stdlib.h>
 
+#ifdef USE_NATIVE
 deferred_addr * defer_address(deferred_addr * old_head, uint32_t address, uint8_t *dest)
 {
 	deferred_addr * new_head = malloc(sizeof(deferred_addr));
@@ -50,6 +51,7 @@ void process_deferred(deferred_addr ** head_ptr, void * context, native_addr_fun
 		}
 	}
 }
+#endif
 
 memmap_chunk const *find_map_chunk(uint32_t address, cpu_options *opts, uint16_t flags, uint32_t *size_sum)
 {

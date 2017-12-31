@@ -19,10 +19,13 @@ void render_infobox(char * title, char * buf)
 {
 }
 
+uint64_t total_cycles;
+
 m68k_context * sync_components(m68k_context * context, uint32_t address)
 {
 	if (context->current_cycle > 0x80000000) {
 		context->current_cycle -= 0x80000000;
+		total_cycles += 0x80000000;
 	}
 	if (context->status & M68K_STATUS_TRACE || context->trace_pending) {
 		context->target_cycle = context->current_cycle;
@@ -33,6 +36,8 @@ m68k_context * sync_components(m68k_context * context, uint32_t address)
 m68k_context *reset_handler(m68k_context *context)
 {
 	m68k_print_regs(context);
+	total_cycles += context->current_cycle;
+	printf("%ld cycles\n", total_cycles);
 	exit(0);
 	//unreachable
 	return context;
@@ -70,14 +75,15 @@ int main(int argc, char ** argv)
 	memmap[1].flags = MMAP_READ | MMAP_WRITE | MMAP_CODE;
 	memmap[1].buffer = malloc(64 * 1024);
 	memset(memmap[1].buffer, 0, 64 * 1024);
-	init_m68k_opts(&opts, memmap, 2, 1);
+	init_m68k_opts(&opts, memmap, 2, 7);
 	m68k_context * context = init_68k_context(&opts, reset_handler);
 	context->mem_pointers[0] = memmap[0].buffer;
 	context->mem_pointers[1] = memmap[1].buffer;
 	context->target_cycle = context->sync_cycle = 0x80000000;
+	/*
 	uint32_t address;
 	address = filebuf[2] << 16 | filebuf[3];
-	translate_m68k_stream(address, context);
+	translate_m68k_stream(address, context);*/
 	m68k_reset(context);
 	return 0;
 }

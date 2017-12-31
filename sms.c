@@ -348,10 +348,12 @@ static void run_sms(system_header *system)
 	render_set_video_standard(VID_NTSC);
 	while (!sms->should_return)
 	{
+#ifdef USE_NATIVE
 		if (system->enter_debugger && sms->z80->pc) {
 			system->enter_debugger = 0;
 			zdebugger(sms->z80, sms->z80->pc);
 		}
+#endif
 		if (sms->z80->nmi_start == CYCLE_NEVER) {
 			uint32_t nmi = vdp_next_nmi(sms->vdp);
 			if (nmi != CYCLE_NEVER) {
@@ -366,6 +368,7 @@ static void run_sms(system_header *system)
 		vdp_run_context(sms->vdp, target_cycle);
 		psg_run(sms->psg, target_cycle);
 		
+#ifdef USE_NATIVE
 		if (system->save_state) {
 			while (!sms->z80->pc) {
 				//advance Z80 to an instruction boundary
@@ -374,6 +377,7 @@ static void run_sms(system_header *system)
 			save_state(sms, system->save_state - 1);
 			system->save_state = 0;
 		}
+#endif
 		
 		target_cycle += 3420*16;
 		if (target_cycle > 0x10000000) {
@@ -410,10 +414,12 @@ static void start_sms(system_header *system, char *statefile)
 		load_state_path(sms, statefile);
 	}
 	
+#ifdef USE_NATIVE
 	if (system->enter_debugger) {
 		system->enter_debugger = 0;
 		zinsert_breakpoint(sms->z80, sms->z80->pc, (uint8_t *)zdebugger);
 	}
+#endif
 	
 	run_sms(system);
 }
@@ -422,7 +428,9 @@ static void soft_reset(system_header *system)
 {
 	sms_context *sms = (sms_context *)system;
 	z80_assert_reset(sms->z80, sms->z80->current_cycle);
+#ifdef USE_NATIVE
 	sms->z80->target_cycle = sms->z80->sync_cycle = sms->z80->current_cycle;
+#endif
 }
 
 static void free_sms(system_header *system)

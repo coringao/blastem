@@ -2,7 +2,7 @@
 start:
 	moveq #36, d0
 	bsr fib
-	illegal
+	reset
 fib:
 	cmp.l #2, d0
 	blt base

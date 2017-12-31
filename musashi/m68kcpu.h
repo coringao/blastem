@@ -39,6 +39,8 @@ struct m68000_base_device {
 	uint32_t v_flag;       /* Overflow */
 	uint32_t c_flag;       /* Carry */
 	uint32_t int_mask;     /* I0-I2 */
+	uint32_t t1_flag;      /* Trace 1 */
+	uint32_t tracing;
 	uint32_t     ir;
 	uint32_t cyc_bcc_notake_b;
 	uint32_t cyc_bcc_notake_w;
@@ -271,27 +273,27 @@ struct m68000_base_device {
 /* These defines are dependant on the configuration defines in m68kconf.h */
 
 /* Disable certain comparisons if we're not using all CPU types */
-#define CPU_TYPE_IS_COLDFIRE(A)    ((A) & (CPU_TYPE_COLDFIRE))
+#define CPU_TYPE_IS_COLDFIRE(A)    0//((A) & (CPU_TYPE_COLDFIRE))
 
-#define CPU_TYPE_IS_040_PLUS(A)    ((A) & (CPU_TYPE_040 | CPU_TYPE_EC040))
+#define CPU_TYPE_IS_040_PLUS(A)    0//((A) & (CPU_TYPE_040 | CPU_TYPE_EC040))
 #define CPU_TYPE_IS_040_LESS(A)    1
 
-#define CPU_TYPE_IS_030_PLUS(A)    ((A) & (CPU_TYPE_030 | CPU_TYPE_EC030 | CPU_TYPE_040 | CPU_TYPE_EC040))
+#define CPU_TYPE_IS_030_PLUS(A)    0//((A) & (CPU_TYPE_030 | CPU_TYPE_EC030 | CPU_TYPE_040 | CPU_TYPE_EC040))
 #define CPU_TYPE_IS_030_LESS(A)    1
 
-#define CPU_TYPE_IS_020_PLUS(A)    ((A) & (CPU_TYPE_020 | CPU_TYPE_030 | CPU_TYPE_EC030 | CPU_TYPE_040 | CPU_TYPE_EC040 | CPU_TYPE_FSCPU32 | CPU_TYPE_COLDFIRE))
+#define CPU_TYPE_IS_020_PLUS(A)    0//((A) & (CPU_TYPE_020 | CPU_TYPE_030 | CPU_TYPE_EC030 | CPU_TYPE_040 | CPU_TYPE_EC040 | CPU_TYPE_FSCPU32 | CPU_TYPE_COLDFIRE))
 #define CPU_TYPE_IS_020_LESS(A)    1
 
-#define CPU_TYPE_IS_020_VARIANT(A) ((A) & (CPU_TYPE_EC020 | CPU_TYPE_020 | CPU_TYPE_FSCPU32))
+#define CPU_TYPE_IS_020_VARIANT(A) 0//((A) & (CPU_TYPE_EC020 | CPU_TYPE_020 | CPU_TYPE_FSCPU32))
 
-#define CPU_TYPE_IS_EC020_PLUS(A)  ((A) & (CPU_TYPE_EC020 | CPU_TYPE_020 | CPU_TYPE_030 | CPU_TYPE_EC030 | CPU_TYPE_040 | CPU_TYPE_EC040 | CPU_TYPE_FSCPU32 | CPU_TYPE_COLDFIRE))
-#define CPU_TYPE_IS_EC020_LESS(A)  ((A) & (CPU_TYPE_000 | CPU_TYPE_008 | CPU_TYPE_010 | CPU_TYPE_EC020))
+#define CPU_TYPE_IS_EC020_PLUS(A)  0//((A) & (CPU_TYPE_EC020 | CPU_TYPE_020 | CPU_TYPE_030 | CPU_TYPE_EC030 | CPU_TYPE_040 | CPU_TYPE_EC040 | CPU_TYPE_FSCPU32 | CPU_TYPE_COLDFIRE))
+#define CPU_TYPE_IS_EC020_LESS(A)  1//((A) & (CPU_TYPE_000 | CPU_TYPE_008 | CPU_TYPE_010 | CPU_TYPE_EC020))
 
-#define CPU_TYPE_IS_010(A)         ((A) == CPU_TYPE_010)
-#define CPU_TYPE_IS_010_PLUS(A)    ((A) & (CPU_TYPE_010 | CPU_TYPE_EC020 | CPU_TYPE_020 | CPU_TYPE_EC030 | CPU_TYPE_030 | CPU_TYPE_040 | CPU_TYPE_EC040 | CPU_TYPE_FSCPU32 | CPU_TYPE_COLDFIRE))
-#define CPU_TYPE_IS_010_LESS(A)    ((A) & (CPU_TYPE_000 | CPU_TYPE_008 | CPU_TYPE_010))
+#define CPU_TYPE_IS_010(A)         0//((A) == CPU_TYPE_010)
+#define CPU_TYPE_IS_010_PLUS(A)    0//((A) & (CPU_TYPE_010 | CPU_TYPE_EC020 | CPU_TYPE_020 | CPU_TYPE_EC030 | CPU_TYPE_030 | CPU_TYPE_040 | CPU_TYPE_EC040 | CPU_TYPE_FSCPU32 | CPU_TYPE_COLDFIRE))
+#define CPU_TYPE_IS_010_LESS(A)    1//((A) & (CPU_TYPE_000 | CPU_TYPE_008 | CPU_TYPE_010))
 
-#define CPU_TYPE_IS_000(A)         ((A) == CPU_TYPE_000 || (A) == CPU_TYPE_008)
+#define CPU_TYPE_IS_000(A)         1//((A) == CPU_TYPE_000 || (A) == CPU_TYPE_008)
 
 
 /* -------------------------- EA / Operand Access ------------------------- */
@@ -462,7 +464,7 @@ struct m68000_base_device {
 								(COND_CS(M) >> 8))
 
 /* Get the status register */
-#define m68ki_get_sr(M)     (/*(M)->t1_flag         |*/ \
+#define m68ki_get_sr(M)     ((M)->t1_flag         | \
 								/*(M)->t0_flag         |*/ \
 							((M)->s_flag   << 11) | \
 							((M)->m_flag   << 11) | \
@@ -638,7 +640,11 @@ void m68k_reset_cpu(m68000_base_device *this);
 void m68k_init_cpu_m68000(m68000_base_device *this);
 
 #define m68ki_trace_t0(M)
-#define m68ki_trace_t1(M)
+#define m68ki_trace_t1(m68k) m68k->tracing = m68k->t1_flag
+/* Clear all tracing */
+#define m68ki_clear_trace(m68k) m68k->tracing = 0
+/* Cause a trace exception if we are tracing */
+#define m68ki_exception_if_trace(m68k) if(m68k->tracing) m68ki_exception_trace(m68k)
 
 
 /* ======================================================================== */
@@ -975,8 +981,8 @@ static inline void m68ki_set_sr_noint(m68000_base_device *m68k, uint32_t value)
 	value &= m68k->sr_mask;
 
 	/* Now set the status register */
-/*	m68k->t1_flag = BIT_F(value);
-	m68k->t0_flag = BIT_E(value);*/
+	m68k->t1_flag = BIT_F(value);
+	//m68k->t0_flag = BIT_E(value);
 	m68k->int_mask = value & 0x0700;
 	m68k->c.target_cycle = m68k->c.current_cycle;
 	m68ki_set_ccr(m68k, value);
@@ -992,8 +998,8 @@ static inline void m68ki_set_sr_noint_nosp(m68000_base_device *m68k, uint32_t va
 	value &= m68k->sr_mask;
 
 	/* Now set the status register */
-	/*m68k->t1_flag = BIT_F(value);
-	m68k->t0_flag = BIT_E(value);*/
+	m68k->t1_flag = BIT_F(value);
+	//m68k->t0_flag = BIT_E(value);
 	m68k->int_mask = value & 0x0700;
 	m68k->c.target_cycle = m68k->c.current_cycle;
 	m68ki_set_ccr(m68k, value);
@@ -1017,8 +1023,8 @@ static inline uint32_t m68ki_init_exception(m68000_base_device *m68k)
 	uint32_t sr = m68ki_get_sr(m68k);
 
 	/* Turn off trace flag, clear pending traces */
-	/*m68k->t1_flag = m68k->t0_flag = 0;
-	m68ki_clear_trace(m68k);*/
+	m68k->t1_flag = 0;//m68k->t0_flag = 0;
+	m68ki_clear_trace(m68k);
 	/* Enter supervisor mode */
 	m68ki_set_s_flag(m68k, SFLAG_SET);
 

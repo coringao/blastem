@@ -65,8 +65,8 @@ endif #PORTABLE
 endif #Windows
 
 ifdef DEBUG
-CFLAGS:=-ggdb $(CFLAGS)
-LDFLAGS:=-ggdb $(LDFLAGS)
+CFLAGS:=-ggdb -Og $(CFLAGS)
+LDFLAGS:=-ggdb -Og $(LDFLAGS)
 else
 ifdef NOLTO
 CFLAGS:=-O2 $(CFLAGS)
@@ -111,23 +111,26 @@ CPU:=i686
 endif
 endif
 
-TRANSOBJS=gen.o backend.o $(MEM) arena.o tern.o
-M68KOBJS=68kinst.o m68k_core.o
+#TRANSOBJS=gen.o backend.o $(MEM) arena.o tern.o
+TRANSOBJS=backend.o tern.o
+M68KOBJS=68kinst.o m68k_core.o musashi/m68kops.o musashi/m68kcpu.o
 ifeq ($(CPU),x86_64)
-M68KOBJS+= m68k_core_x86.o
-TRANSOBJS+= gen_x86.o backend_x86.o
+#M68KOBJS+= m68k_core_x86.o
+#TRANSOBJS+= gen_x86.o backend_x86.o
 else
 ifeq ($(CPU),i686)
-M68KOBJS+= m68k_core_x86.o
-TRANSOBJS+= gen_x86.o backend_x86.o
+#M68KOBJS+= m68k_core_x86.o
+#TRANSOBJS+= gen_x86.o backend_x86.o
 endif
 endif
 
-Z80OBJS=z80inst.o z80_to_x86.o
+#Z80OBJS=z80inst.o z80_to_x86.o
+Z80OBJS=z80inst.o mame_z80/z80.o
 AUDIOOBJS=ym2612.o psg.o wave.o
 CONFIGOBJS=config.o tern.o util.o
 
-MAINOBJS=blastem.o system.o genesis.o debug.o gdb_remote.o vdp.o render_sdl.o ppm.o io.o romdb.o hash.o menu.o xband.o realtec.o i2c.o nor.o sega_mapper.o multi_game.o serialize.o $(TERMINAL) $(CONFIGOBJS) gst.o $(M68KOBJS) $(TRANSOBJS) $(AUDIOOBJS) musashi/m68kops.o musashi/m68kcpu.o
+#MAINOBJS=blastem.o system.o genesis.o debug.o gdb_remote.o vdp.o render_sdl.o ppm.o io.o romdb.o hash.o menu.o xband.o realtec.o i2c.o nor.o sega_mapper.o multi_game.o serialize.o $(TERMINAL) $(CONFIGOBJS) gst.o $(M68KOBJS) $(TRANSOBJS) $(AUDIOOBJS)
+MAINOBJS=blastem.o system.o genesis.o vdp.o render_sdl.o ppm.o io.o romdb.o hash.o menu.o xband.o realtec.o i2c.o nor.o sega_mapper.o multi_game.o serialize.o $(TERMINAL) $(CONFIGOBJS) $(M68KOBJS) $(TRANSOBJS) $(AUDIOOBJS)
 
 ifeq ($(CPU),x86_64)
 CFLAGS+=-DX86_64 -m64

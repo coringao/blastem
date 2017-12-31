@@ -8,7 +8,16 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#ifdef USE_NATIVE
 #include "gen.h"
+#else
+typedef uint8_t * code_ptr;
+typedef struct {
+	code_ptr cur;
+	code_ptr last;
+	uint32_t stack_off;
+} code_info;
+#endif
 
 #define INVALID_OFFSET 0xFFFFFFFF
 #define EXTENSION_WORD 0xFFFFFFFE
@@ -80,11 +89,14 @@ typedef struct {
 
 typedef struct {
 	uint32_t flags;
+#ifdef USE_NATIVE
 	native_map_slot    *native_code_map;
 	deferred_addr      *deferred;
 	code_info          code;
 	uint8_t            **ram_inst_sizes;
+#endif	
 	memmap_chunk const *memmap;
+#ifdef USE_NATIVE
 	code_ptr           save_context;
 	code_ptr           load_context;
 	code_ptr           handle_cycle_limit;
@@ -92,27 +104,33 @@ typedef struct {
 	code_ptr           handle_code_write;
 	code_ptr           handle_align_error_write;
 	code_ptr           handle_align_error_read;
+#endif
 	system_str_fun_r8  debug_cmd_handler;
 	uint32_t           memmap_chunks;
 	uint32_t           address_mask;
 	uint32_t           max_address;
 	uint32_t           bus_cycles;
 	uint32_t           clock_divider;
+#ifdef USE_NATIVE
 	uint32_t           move_pc_off;
 	uint32_t           move_pc_size;
 	int32_t            mem_ptr_off;
 	int32_t            ram_flags_off;
 	uint8_t            ram_flags_shift;
+#endif
 	uint8_t            address_size;
 	uint8_t            byte_swap;
+#ifdef USE_NATIVE
 	int8_t             context_reg;
 	int8_t             cycles;
 	int8_t             limit;
 	int8_t             scratch1;
 	int8_t             scratch2;
 	uint8_t            align_error_mask;
+#endif
 } cpu_options;
 
+#ifdef USE_NATIVE
 typedef uint8_t * (*native_addr_func)(void * context, uint32_t address);
 
 deferred_addr * defer_address(deferred_addr * old_head, uint32_t address, uint8_t *dest);
@@ -129,6 +147,7 @@ void retranslate_calc(cpu_options *opts);
 void patch_for_retranslate(cpu_options *opts, code_ptr native_address, code_ptr handler);
 
 code_ptr gen_mem_fun(cpu_options * opts, memmap_chunk const * memmap, uint32_t num_chunks, ftype fun_type, code_ptr *after_inc);
+#endif
 void * get_native_pointer(uint32_t address, void ** mem_pointers, cpu_options * opts);
 uint16_t read_word(uint32_t address, void **mem_pointers, cpu_options *opts, void *context);
 void write_word(uint32_t address, uint16_t value, void **mem_pointers, cpu_options *opts, void *context);
