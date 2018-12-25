@@ -27,9 +27,14 @@
 #include "terminal.h"
 #include "arena.h"
 #include "config.h"
+#include "bindings.h"
 #include "menu.h"
+#include "zip.h"
+#ifndef DISABLE_NUKLEAR
+#include "nuklear_ui/blastem_nuklear.h"
+#endif
 
-#define BLASTEM_VERSION "0.5.2-pre"
+#define BLASTEM_VERSION "0.6.0-pre"
 
 #ifdef __ANDROID__
 #define FULLSCREEN_DEFAULT 1
@@ -51,37 +56,104 @@ tern_node * config;
 #define SMD_MAGIC3 0xBB
 #define SMD_BLOCK_SIZE 0x4000
 
-int load_smd_rom(long filesize, FILE * f, void **buffer)
+#ifdef DISABLE_ZLIB
+#define ROMFILE FILE*
+#define romopen fopen
+#define romread fread
+#define romseek fseek
+#define romgetc fgetc
+#define romclose fclose
+#else
+#include "zlib/zlib.h"
+#define ROMFILE gzFile
+#define romopen gzopen
+#define romread gzfread
+#define romseek gzseek
+#define romgetc gzgetc
+#define romclose gzclose
+#endif
+
+int load_smd_rom(ROMFILE f, void **buffer)
 {
 	uint8_t block[SMD_BLOCK_SIZE];
-	filesize -= SMD_HEADER_SIZE;
-	fseek(f, SMD_HEADER_SIZE, SEEK_SET);
+	romseek(f, SMD_HEADER_SIZE, SEEK_SET);
 
-	uint16_t *dst = *buffer = malloc(nearest_pow2(filesize));
-	int rom_size = filesize;
-	while (filesize > 0) {
-		fread(block, 1, SMD_BLOCK_SIZE, f);
-		for (uint8_t *low = block, *high = (block+SMD_BLOCK_SIZE/2), *end = block+SMD_BLOCK_SIZE; high < end; high++, low++) {
-			*(dst++) = *low << 8 | *high;
+	size_t filesize = 512 * 1024;
+	size_t readsize = 0;
+	uint16_t *dst = malloc(filesize);
+	
+
+	size_t read;
+	do {
+		if ((readsize + SMD_BLOCK_SIZE > filesize)) {
+			filesize *= 2;
+			dst = realloc(dst, filesize);
 		}
-		filesize -= SMD_BLOCK_SIZE;
-	}
-	return rom_size;
+		read = romread(block, 1, SMD_BLOCK_SIZE, f);
+		if (read > 0) {
+			for (uint8_t *low = block, *high = (block+read/2), *end = block+read; high < end; high++, low++) {
+				*(dst++) = *low << 8 | *high;
+			}
+			readsize += read;
+		}
+	} while(read > 0);
+	romclose(f);
+	
+	*buffer = dst;
+	
+	return readsize;
 }
 
-uint32_t load_rom(char * filename, void **dst, system_type *stype)
+uint32_t load_rom_zip(const char *filename, void **dst)
+{
+	static const char *valid_exts[] = {"bin", "md", "gen", "sms", "rom"};
+	const uint32_t num_exts = sizeof(valid_exts)/sizeof(*valid_exts);
+	zip_file *z = zip_open(filename);
+	if (!z) {
+		return 0;
+	}
+	
+	for (uint32_t i = 0; i < z->num_entries; i++)
+	{
+		char *ext = path_extension(z->entries[i].name);
+		if (!ext) {
+			continue;
+		}
+		for (uint32_t j = 0; j < num_exts; j++)
+		{
+			if (!strcasecmp(ext, valid_exts[j])) {
+				size_t out_size = nearest_pow2(z->entries[i].size);
+				*dst = zip_read(z, i, &out_size);
+				if (*dst) {
+					free(ext);
+					zip_close(z);
+					return out_size;
+				}
+			}
+		}
+		free(ext);
+	}
+	zip_close(z);
+	return 0;
+}
+
+uint32_t load_rom(const char * filename, void **dst, system_type *stype)
 {
 	uint8_t header[10];
-	FILE * f = fopen(filename, "rb");
+	char *ext = path_extension(filename);
+	if (!strcasecmp(ext, "zip")) {
+		free(ext);
+		return load_rom_zip(filename, dst);
+	}
+	free(ext);
+	ROMFILE f = romopen(filename, "rb");
 	if (!f) {
 		return 0;
 	}
-	if (sizeof(header) != fread(header, 1, sizeof(header), f)) {
+	if (sizeof(header) != romread(header, 1, sizeof(header), f)) {
 		fatal_error("Error reading from %s\n", filename);
 	}
-	fseek(f, 0, SEEK_END);
-	long filesize = ftell(f);
-	fseek(f, 0, SEEK_SET);
+	
 	if (header[1] == SMD_MAGIC1 && header[8] == SMD_MAGIC2 && header[9] == SMD_MAGIC3) {
 		int i;
 		for (i = 3; i < 8; i++) {
@@ -96,15 +168,38 @@ uint32_t load_rom(char * filename, void **dst, system_type *stype)
 			if (stype) {
 				*stype = SYSTEM_GENESIS;
 			}
-			return load_smd_rom(filesize, f, dst);
+			return load_smd_rom(f, dst);
 		}
 	}
-	*dst = malloc(nearest_pow2(filesize));
-	if (filesize != fread(*dst, 1, filesize, f)) {
-		fatal_error("Error reading from %s\n", filename);
-	}
-	fclose(f);
-	return filesize;
+	
+	size_t filesize = 512 * 1024;
+	size_t readsize = sizeof(header);
+		
+	char *buf = malloc(filesize);
+	memcpy(buf, header, readsize);
+	
+	size_t read;
+	do {
+		read = romread(buf + readsize, 1, filesize - readsize, f);
+		if (read > 0) {
+			readsize += read;
+			if (readsize == filesize) {
+				int one_more = romgetc(f);
+				if (one_more >= 0) {
+					filesize *= 2;
+					buf = realloc(buf, filesize);
+					buf[readsize++] = one_more;
+				} else {
+					read = 0;
+				}
+			}
+		}
+	} while (read > 0);
+	
+	*dst = buf;
+	
+	romclose(f);
+	return readsize;
 }
 
 
@@ -157,9 +252,10 @@ static char *get_save_dir(system_media *media)
 	return save_dir;
 }
 
-void setup_saves(system_media *media, rom_info *info, system_header *context)
+void setup_saves(system_media *media, system_header *context)
 {
 	static uint8_t persist_save_registered;
+	rom_info *info = &context->info;
 	char *save_dir = get_save_dir(info->is_save_lock_on ? media->chain : media);
 	char const *parts[] = {save_dir, PATH_SEP, info->save_type == SAVE_I2C ? "save.eeprom" : info->save_type == SAVE_NOR ? "save.nor" : "save.sram"};
 	free(save_filename);
@@ -168,7 +264,7 @@ void setup_saves(system_media *media, rom_info *info, system_header *context)
 		//initial save dir was calculated based on lock-on cartridge because that's where the save device is
 		//save directory used for save states should still be located in the normal place
 		free(save_dir);
-		save_dir = get_save_dir(media);
+		parts[0] = save_dir = get_save_dir(media);
 	}
 	if (use_native_states || context->type != SYSTEM_GENESIS) {
 		parts[2] = "quicksave.state";
@@ -187,29 +283,45 @@ void setup_saves(system_media *media, rom_info *info, system_header *context)
 	}
 }
 
+void apply_updated_config(void)
+{
+	render_config_updated();
+	if (current_system && current_system->config_updated) {
+		current_system->config_updated(current_system);
+	}
+}
+
 static void on_drag_drop(const char *filename)
 {
-	if (current_system->next_rom) {
-		free(current_system->next_rom);
-	}
-	current_system->next_rom = strdup(filename);
-	current_system->request_exit(current_system);
-	if (menu_system && menu_system->type == SYSTEM_GENESIS) {
-		genesis_context *gen = (genesis_context *)menu_system;
-		if (gen->extra) {
-			menu_context *menu = gen->extra;
-			menu->external_game_load = 1;
-		} else {
-			puts("No extra");
+	if (current_system) {
+		if (current_system->next_rom) {
+			free(current_system->next_rom);
+		}
+		current_system->next_rom = strdup(filename);
+		current_system->request_exit(current_system);
+		if (menu_system && menu_system->type == SYSTEM_GENESIS) {
+			genesis_context *gen = (genesis_context *)menu_system;
+			if (gen->extra) {
+				menu_context *menu = gen->extra;
+				menu->external_game_load = 1;
+			}
 		}
 	} else {
-		puts("no menu");
+		init_system_with_media(filename, SYSTEM_UNKNOWN);
 	}
+#ifndef DISABLE_NUKLEAR
+	if (is_nuklear_active()) {
+		show_play_view();
+	}
+#endif
 }
 
 static system_media cart, lock_on;
 void reload_media(void)
 {
+	if (!current_system) {
+		return;
+	}
 	if (current_system->next_rom) {
 		free(current_system->next_rom);
 	}
@@ -238,6 +350,58 @@ void lockon_media(char *lock_on_path)
 	lock_on.size = load_rom(lock_on_path, &lock_on.buffer, NULL);
 }
 
+static uint32_t opts = 0;
+static uint8_t force_region = 0;
+void init_system_with_media(const char *path, system_type force_stype)
+{
+	if (game_system) {
+		game_system->persist_save(game_system);
+#ifdef USE_NATIVE
+		//swap to game context arena and mark all allocated pages in it free
+		if (current_system == menu_system) {
+			current_system->arena = set_current_arena(game_system->arena);
+		}
+		mark_all_free();
+#endif
+		game_system->free_context(game_system);
+#ifdef USE_NATIVE
+	} else if(current_system) {
+		//start a new arena and save old one in suspended system context
+		current_system->arena = start_new_arena();
+#endif
+	}
+	system_type stype = SYSTEM_UNKNOWN;
+	if (!(cart.size = load_rom(path, &cart.buffer, &stype))) {
+		fatal_error("Failed to open %s for reading\n", path);
+	}
+	free(cart.dir);
+	free(cart.name);
+	free(cart.extension);
+	cart.dir = path_dirname(path);
+	cart.name = basename_no_extension(path);
+	cart.extension = path_extension(path);
+	if (force_stype != SYSTEM_UNKNOWN) {
+		stype = force_stype;
+	}
+	if (stype == SYSTEM_UNKNOWN) {
+		stype = detect_system_type(&cart);
+	}
+	if (stype == SYSTEM_UNKNOWN) {
+		fatal_error("Failed to detect system type for %s\n", path);
+	}
+	//allocate new system context
+	game_system = alloc_config_system(stype, &cart, opts, force_region);
+	if (!game_system) {
+		fatal_error("Failed to configure emulated machine for %s\n", path);
+	}
+	if (menu_system) {
+		menu_system->next_context = game_system;
+	}
+	game_system->next_context = menu_system;
+	setup_saves(&cart, game_system);
+	update_title(game_system->info.name);
+}
+
 int main(int argc, char ** argv)
 {
 	set_exe_str(argv[0]);
@@ -245,10 +409,8 @@ int main(int argc, char ** argv)
 	int width = -1;
 	int height = -1;
 	int debug = 0;
-	uint32_t opts = 0;
 	int loaded = 0;
 	system_type stype = SYSTEM_UNKNOWN, force_stype = SYSTEM_UNKNOWN;
-	uint8_t force_region = 0;
 	char * romfname = NULL;
 	char * statefile = NULL;
 	debugger_type dtype = DEBUGGER_NATIVE;
@@ -387,35 +549,6 @@ int main(int argc, char ** argv)
 			height = atoi(argv[i]);
 		}
 	}
-	uint8_t menu = !loaded;
-	if (!loaded) {
-		//load menu
-		romfname = tern_find_path(config, "ui\0rom\0", TVAL_PTR).ptrval;
-		if (!romfname) {
-			romfname = "menu.bin";
-		}
-		if (is_absolute_path(romfname)) {
-			if (!(cart.size = load_rom(romfname, &cart.buffer, &stype))) {
-				fatal_error("Failed to open UI ROM %s for reading", romfname);
-			}
-		} else {
-			cart.buffer = (uint16_t *)read_bundled_file(romfname, &cart.size);
-			if (!cart.buffer) {
-				fatal_error("Failed to open UI ROM %s for reading", romfname);
-			}
-			uint32_t rom_size = nearest_pow2(cart.size);
-			if (rom_size > cart.size) {
-				cart.buffer = realloc(cart.buffer, rom_size);
-				cart.size = rom_size;
-			}
-		}
-		//force system detection, value on command line is only for games not the menu
-		stype = detect_system_type(&cart);
-		cart.dir = path_dirname(romfname);
-		cart.name = basename_no_extension(romfname);
-		cart.extension = path_extension(romfname);
-		loaded = 1;
-	}
 	
 	int def_width = 0, def_height = 0;
 	char *config_width = tern_find_path(config, "video\0width\0", TVAL_PTR).ptrval;
@@ -443,17 +576,40 @@ int main(int argc, char ** argv)
 		render_init(width, height, "BlastEm", fullscreen);
 		render_set_drag_drop_handler(on_drag_drop);
 	}
-
-	if (stype == SYSTEM_UNKNOWN) {
+	set_bindings();
+	
+	uint8_t menu = !loaded;
+	uint8_t use_nuklear = 0;
+#ifndef DISABLE_NUKLEAR
+	use_nuklear = is_nuklear_available();
+#endif
+	if (!loaded && !use_nuklear) {
+		//load menu
+		romfname = tern_find_path(config, "ui\0rom\0", TVAL_PTR).ptrval;
+		if (!romfname) {
+			romfname = "menu.bin";
+		}
+		if (is_absolute_path(romfname)) {
+			if (!(cart.size = load_rom(romfname, &cart.buffer, &stype))) {
+				fatal_error("Failed to open UI ROM %s for reading", romfname);
+			}
+		} else {
+			cart.buffer = (uint16_t *)read_bundled_file(romfname, &cart.size);
+			if (!cart.buffer) {
+				fatal_error("Failed to open UI ROM %s for reading", romfname);
+			}
+			uint32_t rom_size = nearest_pow2(cart.size);
+			if (rom_size > cart.size) {
+				cart.buffer = realloc(cart.buffer, rom_size);
+				cart.size = rom_size;
+			}
+		}
+		//force system detection, value on command line is only for games not the menu
 		stype = detect_system_type(&cart);
-	}
-	if (stype == SYSTEM_UNKNOWN) {
-		fatal_error("Failed to detect system type for %s\n", romfname);
-	}
-	rom_info info;
-	current_system = alloc_config_system(stype, &cart, menu ? 0 : opts, force_region, &info);
-	if (!current_system) {
-		fatal_error("Failed to configure emulated machine for %s\n", romfname);
+		cart.dir = path_dirname(romfname);
+		cart.name = basename_no_extension(romfname);
+		cart.extension = path_extension(romfname);
+		loaded = 1;
 	}
 	char *state_format = tern_find_path(config, "ui\0state_format\0", TVAL_PTR).ptrval;
 	if (state_format && !strcmp(state_format, "gst")) {
@@ -461,14 +617,36 @@ int main(int argc, char ** argv)
 	} else if (state_format && strcmp(state_format, "native")) {
 		warning("%s is not a valid value for the ui.state_format setting. Valid values are gst and native\n", state_format);
 	}
-	setup_saves(&cart, &info, current_system);
-	update_title(info.name);
-	if (menu) {
-		menu_system = current_system;
-	} else {
-		game_system = current_system;
-	}
 
+	if (loaded) {
+		if (stype == SYSTEM_UNKNOWN) {
+			stype = detect_system_type(&cart);
+		}
+		if (stype == SYSTEM_UNKNOWN) {
+			fatal_error("Failed to detect system type for %s\n", romfname);
+		}
+		current_system = alloc_config_system(stype, &cart, menu ? 0 : opts, force_region);
+		if (!current_system) {
+			fatal_error("Failed to configure emulated machine for %s\n", romfname);
+		}
+	
+		setup_saves(&cart, current_system);
+		update_title(current_system->info.name);
+		if (menu) {
+			menu_system = current_system;
+		} else {
+			game_system = current_system;
+		}
+	}
+	
+#ifndef DISABLE_NUKLEAR
+	if (use_nuklear) {
+		blastem_nuklear_init(!menu);
+		current_system = game_system;
+		menu = 0;
+	}
+#endif
+	
 	current_system->debugger_type = dtype;
 	current_system->enter_debugger = start_in_debugger && menu == debug_target;
 	current_system->start_context(current_system,  menu ? NULL : statefile);
@@ -480,49 +658,7 @@ int main(int argc, char ** argv)
 		if (current_system->next_rom) {
 			char *next_rom = current_system->next_rom;
 			current_system->next_rom = NULL;
-			if (game_system) {
-				game_system->persist_save(game_system);
-#ifdef USE_NATIVE
-				//swap to game context arena and mark all allocated pages in it free
-				if (menu) {
-					current_system->arena = set_current_arena(game_system->arena);
-				}
-				mark_all_free();
-#endif
-				game_system->free_context(game_system);
-			} else {
-#ifdef USE_NATIVE
-				//start a new arena and save old one in suspended genesis context
-				current_system->arena = start_new_arena();
-#endif
-			}
-			if (!(cart.size = load_rom(next_rom, &cart.buffer, &stype))) {
-				fatal_error("Failed to open %s for reading\n", next_rom);
-			}
-			free(cart.dir);
-			free(cart.name);
-			free(cart.extension);
-			cart.dir = path_dirname(next_rom);
-			cart.name = basename_no_extension(next_rom);
-			cart.extension = path_extension(next_rom);
-			stype = force_stype;
-			if (stype == SYSTEM_UNKNOWN) {
-				stype = detect_system_type(&cart);
-			}
-			if (stype == SYSTEM_UNKNOWN) {
-				fatal_error("Failed to detect system type for %s\n", next_rom);
-			}
-			//allocate new system context
-			game_system = alloc_config_system(stype, &cart, opts,force_region, &info);
-			if (!game_system) {
-				fatal_error("Failed to configure emulated machine for %s\n", next_rom);
-			}
-			if (menu_system) {
-				menu_system->next_context = game_system;
-			}
-			game_system->next_context = menu_system;
-			setup_saves(&cart, &info, game_system);
-			update_title(info.name);
+			init_system_with_media(next_rom, force_stype);
 			free(next_rom);
 			menu = 0;
 			current_system = game_system;
@@ -536,13 +672,21 @@ int main(int argc, char ** argv)
 			current_system = game_system;
 			menu = 0;
 			current_system->resume_context(current_system);
-		} else if (!menu && menu_system) {
-#ifdef USE_NATIVE
-			current_system->arena = set_current_arena(menu_system->arena);
+		} else if (!menu && (menu_system || use_nuklear)) {
+			if (use_nuklear) {
+#ifndef DISABLE_NUKLEAR
+				ui_idle_loop();
 #endif
-			current_system = menu_system;
-			menu = 1;
-			current_system->resume_context(current_system);
+			} else {
+#ifdef USE_NATIVE
+				current_system->arena = set_current_arena(menu_system->arena);
+#endif
+				current_system = menu_system;
+				menu = 1;
+			}
+			if (!current_system->next_rom) {
+				current_system->resume_context(current_system);
+			}
 		} else {
 			break;
 		}

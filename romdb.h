@@ -31,6 +31,8 @@ typedef struct {
 	uint32_t    page_size;
 	uint32_t    current_page;
 	uint32_t    last_write_cycle;
+	uint32_t    cmd_address1;
+	uint32_t    cmd_address2;
 	uint16_t    product_id;
 	uint8_t     mode;
 	uint8_t     cmd_state;
@@ -43,13 +45,14 @@ enum {
 	MAPPER_SEGA,
 	MAPPER_REALTEC,
 	MAPPER_XBAND,
-	MAPPER_MULTI_GAME
+	MAPPER_MULTI_GAME,
+	MAPPER_JCART
 };
 
 
 typedef struct rom_info rom_info;
 
-#include "backend.h"
+#include "memmap.h"
 
 struct rom_info {
 	char          *name;
@@ -61,13 +64,12 @@ struct rom_info {
 	char          *port2_override;
 	char          *ext_override;
 	char          *mouse_mode;
+	nor_state     *nor;
 	uint32_t      num_eeprom;
 	uint32_t      map_chunks;
 	uint32_t      rom_size;
 	uint32_t      save_size;
 	uint32_t      save_mask;
-	uint32_t      save_page_size;
-	uint16_t      save_product_id;
 	uint16_t      mapper_start_index;
 	uint8_t       save_type;
 	uint8_t       save_bus; //only used for NOR currently
@@ -87,6 +89,7 @@ char const *save_type_name(uint8_t save_type);
 //Note: free_rom_info only frees things pointed to by a rom_info struct, not the struct itself
 //this is because rom_info structs are typically stack allocated
 void free_rom_info(rom_info *info);
+typedef struct system_header system_header;
 void cart_serialize(system_header *sys, serialize_buffer *buf);
 void cart_deserialize(deserialize_buffer *buf, void *vcontext);
 

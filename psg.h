@@ -8,23 +8,15 @@
 
 #include <stdint.h>
 #include "serialize.h"
+#include "render.h"
 
 typedef struct {
-	int16_t  *audio_buffer;
-	int16_t  *back_buffer;
-	uint64_t buffer_fraction;
-	uint64_t buffer_inc;
-	uint32_t buffer_pos;
+	audio_source *audio;
 	uint32_t clock_inc;
 	uint32_t cycles;
-	uint32_t sample_rate;
-	uint32_t samples_frame;
-	int32_t lowpass_alpha;
 	uint16_t lsfr;
 	uint16_t counter_load[4];
 	uint16_t counters[4];
-	int16_t  accum;
-	int16_t  last_sample;
 	uint8_t  volume[4];
 	uint8_t  output_state[4];
 	uint8_t  noise_out;
@@ -34,7 +26,7 @@ typedef struct {
 } psg_context;
 
 
-void psg_init(psg_context * context, uint32_t sample_rate, uint32_t master_clock, uint32_t clock_div, uint32_t samples_frame, uint32_t lowpass_cutoff);
+void psg_init(psg_context * context, uint32_t master_clock, uint32_t clock_div);
 void psg_free(psg_context *context);
 void psg_adjust_master_clock(psg_context * context, uint32_t master_clock);
 void psg_write(psg_context * context, uint8_t value);

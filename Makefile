@@ -16,6 +16,8 @@ endif
 
 MEM:=mem_win.o
 TERMINAL:=terminal_win.o
+FONT:=nuklear_ui/font_win.o
+NET:=net_win.o
 EXE:=.exe
 CC:=i686-w64-mingw32-gcc-win32
 CFLAGS:=-std=gnu99 -Wreturn-type -Werror=return-type -Werror=implicit-function-declaration -I"$(SDL2_PREFIX)/include/SDL2" -I"$(GLEW_PREFIX)/include" -DGLEW_STATIC
@@ -26,16 +28,19 @@ else
 
 MEM:=mem.o
 TERMINAL:=terminal.o
+NET:=net.o
 EXE:=
 
 ifeq ($(OS),Darwin)
 LIBS=sdl2 glew
+FONT:=nuklear_ui/font_mac.o
 else
 LIBS=sdl2 glew gl
+FONT:=nuklear_ui/font.o
 endif #Darwin
 
 HAS_PROC:=$(shell if [ -d /proc ]; then /bin/echo -e -DHAS_PROC; fi)
-CFLAGS:=-std=gnu99 -Wreturn-type -Werror=return-type -Werror=implicit-function-declaration -Wno-unused-value $(HAS_PROC)
+CFLAGS:=-std=gnu99 -Wreturn-type -Werror=return-type -Werror=implicit-function-declaration -Wno-unused-value $(HAS_PROC) -DHAVE_UNISTD_H
 ifeq ($(OS),Darwin)
 #This should really be based on whether or not the C compiler is clang rather than based on the OS
 CFLAGS+= -Wno-logical-op-parentheses
@@ -46,7 +51,7 @@ LDFLAGS:=-lm glew/lib/libGLEW.a
 
 ifeq ($(OS),Darwin)
 CFLAGS+= -IFrameworks/SDL2.framework/Headers
-LDFLAGS+= -FFrameworks -framework SDL2 -framework OpenGL
+LDFLAGS+= -FFrameworks -framework SDL2 -framework OpenGL -framework AppKit
 FIXUP:=install_name_tool -change @rpath/SDL2.framework/Versions/A/SDL2 @executable_path/Frameworks/SDL2.framework/Versions/A/SDL2
 else
 CFLAGS+= -Isdl/include
@@ -58,14 +63,14 @@ CFLAGS:=$(shell pkg-config --cflags-only-I $(LIBS)) $(CFLAGS)
 LDFLAGS:=-lm $(shell pkg-config --libs $(LIBS))
 
 ifeq ($(OS),Darwin)
-LDFLAGS+= -framework OpenGL
+LDFLAGS+= -framework OpenGL -framework AppKit
 endif
 
 endif #PORTABLE
 endif #Windows
 
 ifdef DEBUG
-OPT:=-ggdb -Og
+OPT:=-g3 -O0
 else
 ifdef NOLTO
 OPT:=-O2
@@ -86,6 +91,7 @@ LDFLAGS+= -Wl,--no-as-needed -lprofiler -Wl,--as-needed
 endif
 ifdef NOGL
 CFLAGS+= -DDISABLE_OPENGL
+NONUKLEAR:=1
 endif
 
 ifdef M68030
@@ -127,10 +133,28 @@ endif
 #Z80OBJS=z80inst.o z80_to_x86.o
 Z80OBJS=z80inst.o mame_z80/z80.o
 AUDIOOBJS=ym2612.o psg.o wave.o
-CONFIGOBJS=config.o tern.o util.o
+CONFIGOBJS=config.o tern.o util.o paths.o 
+NUKLEAROBJS=$(FONT) nuklear_ui/blastem_nuklear.o nuklear_ui/sfnt.o controller_info.o
+RENDEROBJS=render_sdl.o ppm.o
+LIBZOBJS=zlib/adler32.o zlib/compress.o zlib/crc32.o zlib/deflate.o zlib/gzclose.o zlib/gzlib.o zlib/gzread.o\
+	zlib/gzwrite.o zlib/infback.o zlib/inffast.o zlib/inflate.o zlib/inftrees.o zlib/trees.o zlib/uncompr.o zlib/zutil.o
+	
+ifdef NOZLIB
+CFLAGS+= -DDISABLE_ZLIB
+else
+RENDEROBJS+= $(LIBZOBJS) png.o
+endif
 
-#MAINOBJS=blastem.o system.o genesis.o debug.o gdb_remote.o vdp.o render_sdl.o ppm.o io.o romdb.o hash.o menu.o xband.o realtec.o i2c.o nor.o sega_mapper.o multi_game.o serialize.o $(TERMINAL) $(CONFIGOBJS) gst.o $(M68KOBJS) $(TRANSOBJS) $(AUDIOOBJS)
-MAINOBJS=blastem.o system.o genesis.o vdp.o render_sdl.o ppm.o io.o romdb.o hash.o menu.o xband.o realtec.o i2c.o nor.o sega_mapper.o multi_game.o serialize.o $(TERMINAL) $(CONFIGOBJS) $(M68KOBJS) $(TRANSOBJS) $(AUDIOOBJS)
+#MAINOBJS=blastem.o system.o genesis.o debug.o gdb_remote.o vdp.o $(RENDEROBJS) io.o romdb.o hash.o menu.o xband.o 
+MAINOBJS=blastem.o system.o genesis.o vdp.o $(RENDEROBJS) io.o romdb.o hash.o menu.o xband.o \
+	realtec.o i2c.o nor.o sega_mapper.o multi_game.o megawifi.o $(NET) serialize.o $(TERMINAL) $(CONFIGOBJS) \
+	$(M68KOBJS) $(TRANSOBJS) $(AUDIOOBJS) saves.o zip.o bindings.o jcart.o
+	
+ifdef NONUKLEAR
+CFLAGS+= -DDISABLE_NUKLEAR
+else
+MAINOBJS+= $(NUKLEAROBJS)
+endif
 
 ifeq ($(CPU),x86_64)
 CFLAGS+=-DX86_64 -m64
@@ -140,7 +164,7 @@ ifeq ($(CPU),i686)
 CFLAGS+=-DX86_32 -m32
 LDFLAGS+=-m32
 else
-$(error $(CPU) is not a supported architecture)
+#$(error $(CPU) is not a supported architecture)
 endif
 endif
 
@@ -165,7 +189,7 @@ blastem$(EXE) : $(MAINOBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 	$(FIXUP) ./$@
 	
-blastjag$(EXE) : jaguar.o jag_video.o render_sdl.o serialize.o $(M68KOBJS) $(TRANSOBJS) $(CONFIGOBJS)
+blastjag$(EXE) : jaguar.o jag_video.o $(RENDEROBJS) serialize.o $(M68KOBJS) $(TRANSOBJS) $(CONFIGOBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 dis$(EXE) : dis.o 68kinst.o tern.o vos_program_module.o
@@ -192,11 +216,11 @@ ztestrun : ztestrun.o serialize.o $(Z80OBJS) $(TRANSOBJS)
 ztestgen : ztestgen.o z80inst.o
 	$(CC) -ggdb -o ztestgen ztestgen.o z80inst.o
 
-stateview$(EXE) : stateview.o vdp.o render_sdl.o ppm.o serialize.o $(CONFIGOBJS) gst.o
+stateview$(EXE) : stateview.o vdp.o $(RENDEROBJS) serialize.o $(CONFIGOBJS) gst.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 	$(FIXUP) ./$@
 
-vgmplay$(EXE) : vgmplay.o render_sdl.o ppm.o serialize.o $(CONFIGOBJS) $(AUDIOOBJS)
+vgmplay$(EXE) : vgmplay.o $(RENDEROBJS) serialize.o $(CONFIGOBJS) $(AUDIOOBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 	$(FIXUP) ./$@
 
@@ -232,6 +256,10 @@ vos_prog_info : vos_prog_info.o vos_program_module.o
 
 %.o : %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
+  
+%.o : %.m
+	$(CC) $(CFLAGS) -c -o $@ $<
+
 %.png : %.xcf
 	xcf2png $< > $@
 
@@ -255,4 +283,4 @@ font.tiles : font.png
 menu.bin : font_interlace_variable.tiles arrow.tiles cursor.tiles button.tiles font.tiles
 
 clean :
-	rm -rf $(ALL) trans ztestrun ztestgen *.o musashi/*.o
+	rm -rf $(ALL) trans ztestrun ztestgen *.o nuklear_ui/*.o zlib/*.o

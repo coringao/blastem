@@ -742,27 +742,6 @@ void translate_m68k_move(m68k_options * opts, m68kinst * inst)
 	cycles(&opts->gen, BUS);
 }
 
-void translate_m68k_clr(m68k_options * opts, m68kinst * inst)
-{
-	code_info *code = &opts->gen.code;
-	update_flags(opts, N0|V0|C0|Z1);
-	int8_t reg = native_reg(&(inst->dst), opts);
-	if (reg >= 0) {
-		cycles(&opts->gen, (inst->extra.size == OPSIZE_LONG ? 6 : 4));
-		xor_rr(code, reg, reg, inst->extra.size);
-		return;
-	}
-	host_ea dst_op;
-	//TODO: fix timing
-	translate_m68k_op(inst, &dst_op, opts, 1);
-	if (dst_op.mode == MODE_REG_DIRECT) {
-		xor_rr(code, dst_op.base, dst_op.base, inst->extra.size);
-	} else {
-		mov_irdisp(code, 0, dst_op.base, dst_op.disp, inst->extra.size);
-	}
-	m68k_save_result(inst, opts);
-}
-
 void translate_m68k_ext(m68k_options * opts, m68kinst * inst)
 {
 	code_info *code = &opts->gen.code;
@@ -780,6 +759,7 @@ void translate_m68k_ext(m68k_options * opts, m68kinst * inst)
 	}
 	inst->extra.size = dst_size;
 	update_flags(opts, N|V0|C0|Z);
+	cycles(&opts->gen, BUS);
 	//M68K EXT only operates on registers so no need for a call to save result here
 }
 
@@ -1210,7 +1190,8 @@ void translate_shift(m68k_options * opts, m68kinst * inst, host_ea *src_op, host
 void translate_m68k_reset(m68k_options *opts, m68kinst *inst)
 {
 	code_info *code = &opts->gen.code;
-	cycles(&opts->gen, BUS);
+	//RESET instructions take a long time to give peripherals time to reset themselves
+	cycles(&opts->gen, 132);
 	mov_rdispr(code, opts->gen.context_reg, offsetof(m68k_context, reset_handler), opts->gen.scratch1, SZ_PTR);
 	cmp_ir(code, 0, opts->gen.scratch1, SZ_PTR);
 	code_ptr no_reset_handler = code->cur + 1;
@@ -1437,6 +1418,7 @@ void op_r(code_info *code, m68kinst *inst, uint8_t dst, uint8_t size)
 {
 	switch(inst->op)
 	{
+	case M68K_CLR:   xor_rr(code, dst, dst, size); break;
 	case M68K_NEG:   neg_r(code, dst, size); break;
 	case M68K_NOT:   not_r(code, dst, size); cmp_ir(code, 0, dst, size); break;
 	case M68K_ROL:   rol_clr(code, dst, size); break;
@@ -1452,6 +1434,7 @@ void op_rdisp(code_info *code, m68kinst *inst, uint8_t dst, int32_t disp, uint8_
 {
 	switch(inst->op)
 	{
+	case M68K_CLR:   mov_irdisp(code, 0, dst, disp, size); break;
 	case M68K_NEG:   neg_rdisp(code, dst, disp, size); break;
 	case M68K_NOT:   not_rdisp(code, dst, disp, size); cmp_irdisp(code, 0, dst, disp, size); break;
 	case M68K_ROL:   rol_clrdisp(code, dst, disp, size); break;
@@ -1466,7 +1449,11 @@ void op_rdisp(code_info *code, m68kinst *inst, uint8_t dst, int32_t disp, uint8_
 void translate_m68k_unary(m68k_options *opts, m68kinst *inst, uint32_t flag_mask, host_ea *dst_op)
 {
 	code_info *code = &opts->gen.code;
-	cycles(&opts->gen, BUS);
+	uint32_t num_cycles = BUS;
+	if (inst->extra.size == OPSIZE_LONG && (inst->dst.addr_mode == MODE_REG || inst->dst.addr_mode == MODE_AREG)) {
+		num_cycles += 2;
+	}
+	cycles(&opts->gen, num_cycles);
 	if (dst_op->mode == MODE_REG_DIRECT) {
 		op_r(code, inst, dst_op->base, inst->extra.size);
 	} else {
@@ -1508,6 +1495,8 @@ void translate_m68k_abcd_sbcd(m68k_options *opts, m68kinst *inst, host_ea *src_o
 		//destination is in memory so we need to preserve scratch2 for the write at the end
 		push_r(code, opts->gen.scratch2);
 	}
+	//MC68000 User's Manual suggests NBCD hides the 2 cycle penalty during the write cycle somehow
+	cycles(&opts->gen, inst->op == M68K_NBCD && inst->dst.addr_mode != MODE_REG_DIRECT ? BUS : BUS + 2);
 	uint8_t other_reg;
 	//WARNING: This may need adjustment if register assignments change
 	if (opts->gen.scratch2 > RBX) {
@@ -2365,7 +2354,7 @@ void translate_m68k_stop(m68k_options *opts, m68kinst *inst)
 	}
 	code_ptr loop_top = code->cur;
 		call(code, opts->do_sync);
-		cmp_rr(code, opts->gen.limit, opts->gen.cycles, SZ_D);
+		cmp_rr(code, opts->gen.cycles, opts->gen.limit, SZ_D);
 		code_ptr normal_cycle_up = code->cur + 1;
 		jcc(code, CC_A, code->cur + 2);
 			cycles(&opts->gen, BUS);
@@ -2454,6 +2443,7 @@ void translate_m68k_odd(m68k_options *opts, m68kinst *inst)
 void translate_m68k_move_from_sr(m68k_options *opts, m68kinst *inst, host_ea *src_op, host_ea *dst_op)
 {
 	code_info *code = &opts->gen.code;
+	cycles(&opts->gen, inst->dst.addr_mode == MODE_REG_DIRECT ? BUS+2 : BUS);
 	call(code, opts->get_sr);
 	if (dst_op->mode == MODE_REG_DIRECT) {
 		mov_rr(code, opts->gen.scratch1, dst_op->base, SZ_W);
