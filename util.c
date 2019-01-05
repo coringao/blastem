@@ -204,6 +204,85 @@ void bin_to_hex(uint8_t *output, uint8_t *input, uint64_t size)
 	*(output++) = 0;
 }
 
+char *utf16be_to_utf8(uint8_t *buf, uint32_t max_size)
+{
+	uint8_t *cur = buf;
+	uint32_t converted_size = 0;
+	for (uint32_t i = 0; i < max_size; i++, cur+=2)
+	{
+		uint16_t code = *cur << 16 | cur[1];
+		if (!code) {
+			break;
+		}
+		if (code < 0x80) {
+			converted_size++;
+		} else if (code < 0x800) {
+			converted_size += 2;
+		} else {
+			//TODO: Deal with surrogate pairs
+			converted_size += 3;
+		}
+	}
+	char *out = malloc(converted_size + 1);
+	char *cur_out = out;
+	cur = buf;
+	for (uint32_t i = 0; i < max_size; i++, cur+=2)
+	{
+		uint16_t code = *cur << 16 | cur[1];
+		if (!code) {
+			break;
+		}
+		if (code < 0x80) {
+			*(cur_out++) = code;
+		} else if (code < 0x800) {
+			*(cur_out++) = 0xC0 | code >> 6;
+			*(cur_out++) = 0x80 | (code & 0x3F);
+		} else {
+			//TODO: Deal with surrogate pairs
+			*(cur_out++) = 0xF0 | code >> 12;
+			*(cur_out++) = 0x80 | (code >> 6 & 0x3F);
+			*(cur_out++) = 0x80 | (code & 0x3F);
+		}
+	}
+	*cur_out = 0;
+	return out;
+}
+
+int utf8_codepoint(const char **text)
+{
+	uint8_t initial = **text;
+	(*text)++;
+	if (initial < 0x80) {
+		return initial;
+	}
+	int base = 0;
+	uint8_t extended_bytes = 0;
+	if ((initial & 0xE0) == 0xC0) {
+		base = 0x80;
+		initial &= 0x1F;
+		extended_bytes = 1;
+	} else if ((initial & 0xF0) == 0xE0) {
+		base = 0x800;
+		initial &= 0xF;
+		extended_bytes = 2;
+	} else if ((initial & 0xF8) == 0xF0) {
+		base = 0x10000;
+		initial &= 0x7;
+		extended_bytes = 3;
+	}
+	int value = initial;
+	for (uint8_t i = 0; i < extended_bytes; i++)
+	{
+		if ((**text & 0xC0) != 0x80) {
+			return -1;
+		}
+		value = value << 6;
+		value |= (**text) & 0x3F;
+		(*text)++;
+	}
+	return value + base;
+}
+
 char is_path_sep(char c)
 {
 #ifdef _WIN32
@@ -224,11 +303,11 @@ char is_absolute_path(char *path)
 	return is_path_sep(path[0]);
 }
 
-char * basename_no_extension(char *path)
+char * basename_no_extension(const char *path)
 {
-	char *lastdot = NULL;
-	char *lastslash = NULL;
-	char *cur;
+	const char *lastdot = NULL;
+	const char *lastslash = NULL;
+	const char *cur;
 	for (cur = path; *cur; cur++)
 	{
 		if (*cur == '.') {
@@ -250,11 +329,11 @@ char * basename_no_extension(char *path)
 	return barename;
 }
 
-char *path_extension(char *path)
+char *path_extension(char const *path)
 {
-	char *lastdot = NULL;
-	char *lastslash = NULL;
-	char *cur;
+	char const *lastdot = NULL;
+	char const *lastslash = NULL;
+	char const *cur;
 	for (cur = path; *cur; cur++)
 	{
 		if (*cur == '.') {
@@ -270,10 +349,28 @@ char *path_extension(char *path)
 	return strdup(lastdot+1);
 }
 
-char * path_dirname(char *path)
+uint8_t path_matches_extensions(char *path, char **ext_list, uint32_t num_exts)
 {
-	char *lastslash = NULL;
-	char *cur;
+	char *ext = path_extension(path);
+	if (!ext) {
+		return 0;
+	}
+	uint32_t extidx;
+	for (extidx = 0; extidx < num_exts; extidx++)
+	{
+		if (!strcasecmp(ext, ext_list[extidx])) {
+			free(ext);
+			return 1;
+		}
+	}
+	free(ext);
+	return 0;
+}
+
+char * path_dirname(const char *path)
+{
+	const char *lastslash = NULL;
+	const char *cur;
 	for (cur = path; *cur; cur++)
 	{
 		if (is_path_sep(*cur)) {
@@ -440,34 +537,70 @@ char * get_exe_dir()
 
 dir_entry *get_dir_list(char *path, size_t *numret)
 {
-	HANDLE dir;
-	WIN32_FIND_DATA file;
-	char *pattern = alloc_concat(path, "/*.*");
-	dir = FindFirstFile(pattern, &file);
-	free(pattern);
-	if (dir == INVALID_HANDLE_VALUE) {
+	dir_entry *ret;
+	if (path[0] == PATH_SEP[0] && !path[1]) {
+		int drives = GetLogicalDrives();
+		size_t count = 0;
+		for (int i = 0; i < 26; i++)
+		{
+			if (drives & (1 << i)) {
+				count++;
+			}
+		}
+		ret = calloc(count, sizeof(dir_entry));
+		dir_entry *cur = ret;
+		for (int i = 0; i < 26; i++)
+		{
+			if (drives & (1 << i)) {
+				cur->name = malloc(4);
+				cur->name[0] = 'A' + i;
+				cur->name[1] = ':';
+				cur->name[2] = PATH_SEP[0];
+				cur->name[3] = 0;
+				cur->is_dir = 1;
+				cur++;
+			}
+		}
 		if (numret) {
-			*numret = 0;
+			*numret = count;
 		}
-		return NULL;
-	}
-	
-	size_t storage = 64;
-	dir_entry *ret = malloc(sizeof(dir_entry) * storage);
-	size_t pos = 0;
-	
-	do {
-		if (pos == storage) {
-			storage = storage * 2;
-			ret = realloc(ret, sizeof(dir_entry) * storage);
+	} else {
+		HANDLE dir;
+		WIN32_FIND_DATA file;
+		char *pattern = alloc_concat(path, "/*.*");
+		dir = FindFirstFile(pattern, &file);
+		free(pattern);
+		if (dir == INVALID_HANDLE_VALUE) {
+			if (numret) {
+				*numret = 0;
+			}
+			return NULL;
 		}
-		ret[pos].name = strdup(file.cFileName);
-		ret[pos++].is_dir = (file.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-	} while (FindNextFile(dir, &file));
-	
-	FindClose(dir);
-	if (numret) {
-		*numret = pos;
+		
+		size_t storage = 64;
+		ret = malloc(sizeof(dir_entry) * storage);
+		size_t pos = 0;
+		
+		if (path[1] == ':' && (!path[2] || (path[2] == PATH_SEP[0] && !path[3]))) {
+			//we are in the root of a drive, add a virtual .. entry
+			//for navigating to the virtual root directory
+			ret[pos].name = strdup("..");
+			ret[pos++].is_dir = 1;
+		}
+		
+		do {
+			if (pos == storage) {
+				storage = storage * 2;
+				ret = realloc(ret, sizeof(dir_entry) * storage);
+			}
+			ret[pos].name = strdup(file.cFileName);
+			ret[pos++].is_dir = (file.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+		} while (FindNextFile(dir, &file));
+		
+		FindClose(dir);
+		if (numret) {
+			*numret = pos;
+		}
 	}
 	return ret;
 }
@@ -489,7 +622,7 @@ time_t get_modification_time(char *path)
 	return (time_t)wintime;
 }
 
-int ensure_dir_exists(char *path)
+int ensure_dir_exists(const char *path)
 {
 	if (CreateDirectory(path, NULL)) {
 		return 1;
@@ -626,6 +759,7 @@ dir_entry *get_dir_list(char *path, size_t *numret)
 	if (numret) {
 		*numret = pos;
 	}
+	closedir(d);
 	return ret;
 }
 
@@ -643,7 +777,7 @@ time_t get_modification_time(char *path)
 #endif
 }
 
-int ensure_dir_exists(char *path)
+int ensure_dir_exists(const char *path)
 {
 	struct stat st;
 	if (stat(path, &st)) {
@@ -678,6 +812,22 @@ void free_dir_list(dir_entry *list, size_t numentries)
 		free(list[i].name);
 	}
 	free(list);
+}
+
+static int sort_dir_alpha(const void *a, const void *b)
+{
+	const dir_entry *da, *db;
+	da = a;
+	db = b;
+	if (da->is_dir != db->is_dir) {
+		return db->is_dir - da->is_dir;
+	}
+	return strcasecmp(((dir_entry *)a)->name, ((dir_entry *)b)->name);
+}
+
+void sort_dir_list(dir_entry *list, size_t num_entries)
+{
+	qsort(list, num_entries, sizeof(dir_entry), sort_dir_alpha);
 }
 
 #ifdef __ANDROID__
@@ -759,6 +909,7 @@ char *read_bundled_file(char *name, uint32_t *sizeret)
 	} else {
 		ret = NULL;
 	}
+	fclose(f);
 	return ret;
 }
 
@@ -776,7 +927,14 @@ char const *get_userdata_dir()
 
 char const *get_config_dir()
 {
-	return get_userdata_dir();
+	static char* confdir;
+	if (!confdir) {
+		char const *base = get_userdata_dir();
+		if (base) {	
+			confdir = alloc_concat(base,  PATH_SEP "blastem");
+		}
+	}
+	return confdir;
 }
 #define CONFIG_PREFIX ""
 #define SAVE_PREFIX ""

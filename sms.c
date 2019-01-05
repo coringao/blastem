@@ -6,6 +6,8 @@
 #include "render.h"
 #include "util.h"
 #include "debug.h"
+#include "saves.h"
+#include "bindings.h"
 
 static void *memory_io_write(uint32_t location, void *vcontext, uint8_t value)
 {
@@ -292,20 +294,13 @@ void sms_deserialize(deserialize_buffer *buf, sms_context *sms)
 
 static void save_state(sms_context *sms, uint8_t slot)
 {
-	char *save_path;
-	if (slot == QUICK_SAVE_SLOT) {
-		save_path = save_state_path;
-	} else {
-		char slotname[] = "slot_0.state";
-		slotname[5] = '0' + slot;
-		char const *parts[] = {sms->header.save_dir, PATH_SEP, slotname};
-		save_path = alloc_concat_m(3, parts);
-	}
+	char *save_path = get_slot_name(&sms->header, slot, "state");
 	serialize_buffer state;
 	init_serialize(&state);
 	sms_serialize(sms, &state);
 	save_to_file(&state, save_path);
 	printf("Saved state to %s\n", save_path);
+	free(save_path);
 	free(state.data);
 }
 
@@ -324,30 +319,35 @@ static uint8_t load_state_path(sms_context *sms, char *path)
 static uint8_t load_state(system_header *system, uint8_t slot)
 {
 	sms_context *sms = (sms_context *)system;
-	char numslotname[] = "slot_0.state";
-	char *slotname;
-	if (slot == QUICK_SAVE_SLOT) {
-		slotname = "quicksave.state";
-	} else {
-		numslotname[5] = '0' + slot;
-		slotname = numslotname;
+	char *statepath = get_slot_name(system, slot, "state");
+	uint8_t ret;
+	if (!sms->z80->native_pc) {
+		ret = get_modification_time(statepath) != 0;
+		if (ret) {
+			system->delayed_load_slot = slot + 1;
+		}
+		goto done;
+		
 	}
-	char const *parts[] = {sms->header.save_dir, PATH_SEP, slotname};
-	char *statepath = alloc_concat_m(3, parts);
-	uint8_t ret = load_state_path(sms, statepath);
+	ret = load_state_path(sms, statepath);
+done:
 	free(statepath);
 	return ret;
 }
 
 static void run_sms(system_header *system)
 {
-	render_disable_ym();
 	sms_context *sms = (sms_context *)system;
 	uint32_t target_cycle = sms->z80->current_cycle + 3420*16;
 	//TODO: PAL support
 	render_set_video_standard(VID_NTSC);
 	while (!sms->should_return)
 	{
+		if (system->delayed_load_slot) {
+			load_state(system, system->delayed_load_slot - 1);
+			system->delayed_load_slot = 0;
+			
+		}
 		if (system->enter_debugger && sms->z80->pc) {
 			system->enter_debugger = 0;
 			zdebugger(sms->z80, sms->z80->pc);
@@ -386,22 +386,24 @@ static void run_sms(system_header *system)
 			target_cycle -= adjust;
 		}
 	}
+	bindings_release_capture();
 	vdp_release_framebuffer(sms->vdp);
+	render_pause_source(sms->psg->audio);
 	sms->should_return = 0;
-	render_enable_ym();
 }
 
 static void resume_sms(system_header *system)
 {
 	sms_context *sms = (sms_context *)system;
+	bindings_reacquire_capture();
 	vdp_reacquire_framebuffer(sms->vdp);
+	render_resume_source(sms->psg->audio);
 	run_sms(system);
 }
 
 static void start_sms(system_header *system, char *statefile)
 {
 	sms_context *sms = (sms_context *)system;
-	set_keybindings(&sms->io);
 	
 	z80_assert_reset(sms->z80, 0);
 	z80_clear_reset(sms->z80, 128*15);
@@ -449,19 +451,7 @@ static void request_exit(system_header *system)
 static void inc_debug_mode(system_header *system)
 {
 	sms_context *sms = (sms_context *)system;
-	sms->vdp->debug++;
-	if (sms->vdp->debug == 7) {
-		sms->vdp->debug = 0;
-	}
-}
-
-static void inc_debug_pal(system_header *system)
-{
-	sms_context *sms = (sms_context *)system;
-	sms->vdp->debug_pal++;
-	if (sms->vdp->debug_pal == 4) {
-		sms->vdp->debug_pal = 0;
-	}
+	vdp_inc_debug_mode(sms->vdp);
 }
 
 static void load_save(system_header *system)
@@ -474,14 +464,74 @@ static void persist_save(system_header *system)
 	//TODO: Implement me
 }
 
-sms_context *alloc_configure_sms(system_media *media, uint32_t opts, uint8_t force_region, rom_info *info_out)
+static void gamepad_down(system_header *system, uint8_t gamepad_num, uint8_t button)
 {
-	memset(info_out, 0, sizeof(*info_out));
+	sms_context *sms = (sms_context *)system;
+	if (gamepad_num == GAMEPAD_MAIN_UNIT) {
+		if (button == MAIN_UNIT_PAUSE) {
+			vdp_pbc_pause(sms->vdp);
+		}
+	} else {
+		io_gamepad_down(&sms->io, gamepad_num, button);
+	}
+}
+
+static void gamepad_up(system_header *system, uint8_t gamepad_num, uint8_t button)
+{
+	sms_context *sms = (sms_context *)system;
+	io_gamepad_up(&sms->io, gamepad_num, button);
+}
+
+static void mouse_down(system_header *system, uint8_t mouse_num, uint8_t button)
+{
+	sms_context *sms = (sms_context *)system;
+	io_mouse_down(&sms->io, mouse_num, button);
+}
+
+static void mouse_up(system_header *system, uint8_t mouse_num, uint8_t button)
+{
+	sms_context *sms = (sms_context *)system;
+	io_mouse_up(&sms->io, mouse_num, button);
+}
+
+static void mouse_motion_absolute(system_header *system, uint8_t mouse_num, uint16_t x, uint16_t y)
+{
+	sms_context *sms = (sms_context *)system;
+	io_mouse_motion_absolute(&sms->io, mouse_num, x, y);
+}
+
+static void mouse_motion_relative(system_header *system, uint8_t mouse_num, int32_t x, int32_t y)
+{
+	sms_context *sms = (sms_context *)system;
+	io_mouse_motion_relative(&sms->io, mouse_num, x, y);
+}
+
+static void keyboard_down(system_header *system, uint8_t scancode)
+{
+	sms_context *sms = (sms_context *)system;
+	io_keyboard_down(&sms->io, scancode);
+}
+
+static void keyboard_up(system_header *system, uint8_t scancode)
+{
+	sms_context *sms = (sms_context *)system;
+	io_keyboard_up(&sms->io, scancode);
+}
+
+static void config_updated(system_header *system)
+{
+	sms_context *sms = (sms_context *)system;
+	setup_io_devices(config, &system->info, &sms->io);
+}
+
+
+sms_context *alloc_configure_sms(system_media *media, uint32_t opts, uint8_t force_region)
+{
 	sms_context *sms = calloc(1, sizeof(sms_context));
 	uint32_t rom_size = nearest_pow2(media->size);
 	memmap_chunk memory_map[6];
 	if (media->size > 0xC000)  {
-		info_out->map_chunks = 6;
+		sms->header.info.map_chunks = 6;
 		uint8_t *ram_reg_overlap = sms->ram + sizeof(sms->ram) - 4;
 		memory_map[0] = (memmap_chunk){0x0000, 0x0400,  0xFFFF,             0, 0, MMAP_READ,                        media->buffer, NULL, NULL, NULL, NULL};
 		memory_map[1] = (memmap_chunk){0x0400, 0x4000,  0xFFFF,             0, 0, MMAP_READ|MMAP_PTR_IDX|MMAP_CODE, NULL,     NULL, NULL, NULL, NULL};
@@ -490,21 +540,21 @@ sms_context *alloc_configure_sms(system_media *media, uint32_t opts, uint8_t for
 		memory_map[4] = (memmap_chunk){0xC000, 0xFFFC,  sizeof(sms->ram)-1, 0, 0, MMAP_READ|MMAP_WRITE|MMAP_CODE,   sms->ram, NULL, NULL, NULL, NULL};
 		memory_map[5] = (memmap_chunk){0xFFFC, 0x10000, 0x0003,             0, 0, MMAP_READ,                        ram_reg_overlap, NULL, NULL, NULL, mapper_write};
 	} else {
-		info_out->map_chunks = 2;
+		sms->header.info.map_chunks = 2;
 		memory_map[0] = (memmap_chunk){0x0000, 0xC000,  rom_size-1,         0, 0, MMAP_READ,                      media->buffer,  NULL, NULL, NULL, NULL};
 		memory_map[1] = (memmap_chunk){0xC000, 0x10000, sizeof(sms->ram)-1, 0, 0, MMAP_READ|MMAP_WRITE|MMAP_CODE, sms->ram, NULL, NULL, NULL, NULL};
 	};
-	info_out->map = malloc(sizeof(memmap_chunk) * info_out->map_chunks);
-	memcpy(info_out->map, memory_map, sizeof(memmap_chunk) * info_out->map_chunks);
+	sms->header.info.map = malloc(sizeof(memmap_chunk) * sms->header.info.map_chunks);
+	memcpy(sms->header.info.map, memory_map, sizeof(memmap_chunk) * sms->header.info.map_chunks);
 	z80_options *zopts = malloc(sizeof(z80_options));
-	init_z80_opts(zopts, info_out->map, info_out->map_chunks, io_map, 4, 15, 0xFF);
+	init_z80_opts(zopts, sms->header.info.map, sms->header.info.map_chunks, io_map, 4, 15, 0xFF);
 	sms->z80 = init_z80_context(zopts);
 	sms->z80->system = sms;
 	sms->z80->options->gen.debug_cmd_handler = debug_commands;
 	
 	sms->rom = media->buffer;
 	sms->rom_size = rom_size;
-	if (info_out->map_chunks > 2) {
+	if (sms->header.info.map_chunks > 2) {
 		sms->z80->mem_pointers[0] = sms->rom;
 		sms->z80->mem_pointers[1] = sms->rom + 0x4000;
 		sms->z80->mem_pointers[2] = sms->rom + 0x8000;
@@ -513,23 +563,20 @@ sms_context *alloc_configure_sms(system_media *media, uint32_t opts, uint8_t for
 		sms->bank_regs[3] = 0x8000 >> 14;
 	}
 	
-	char * lowpass_cutoff_str = tern_find_path(config, "audio\0lowpass_cutoff\0", TVAL_PTR).ptrval;
-	uint32_t lowpass_cutoff = lowpass_cutoff_str ? atoi(lowpass_cutoff_str) : 3390;
-	
 	//TODO: Detect region and pick master clock based off of that
 	sms->normal_clock = sms->master_clock = 53693175;
 	
 	sms->psg = malloc(sizeof(psg_context));
-	psg_init(sms->psg, render_sample_rate(), sms->master_clock, 15*16, render_audio_buffer(), lowpass_cutoff);
+	psg_init(sms->psg, sms->master_clock, 15*16);
 	
-	sms->vdp = malloc(sizeof(vdp_context));
-	init_vdp_context(sms->vdp, 0);
+	sms->vdp = init_vdp_context(0);
 	sms->vdp->system = &sms->header;
 	
-	info_out->save_type = SAVE_NONE;
-	info_out->name = strdup(media->name);
+	sms->header.info.save_type = SAVE_NONE;
+	sms->header.info.name = strdup(media->name);
 	
-	setup_io_devices(config, info_out, &sms->io);
+	setup_io_devices(config, &sms->header.info, &sms->io);
+	sms->header.has_keyboard = io_has_keyboard(&sms->io);
 	
 	sms->header.set_speed_percent = set_speed_percent;
 	sms->header.start_context = start_sms;
@@ -542,7 +589,15 @@ sms_context *alloc_configure_sms(system_media *media, uint32_t opts, uint8_t for
 	sms->header.request_exit = request_exit;
 	sms->header.soft_reset = soft_reset;
 	sms->header.inc_debug_mode = inc_debug_mode;
-	sms->header.inc_debug_pal = inc_debug_pal;
+	sms->header.gamepad_down = gamepad_down;
+	sms->header.gamepad_up = gamepad_up;
+	sms->header.mouse_down = mouse_down;
+	sms->header.mouse_up = mouse_up;
+	sms->header.mouse_motion_absolute = mouse_motion_absolute;
+	sms->header.mouse_motion_relative = mouse_motion_relative;
+	sms->header.keyboard_down = keyboard_down;
+	sms->header.keyboard_up = keyboard_up;
+	sms->header.config_updated = config_updated;
 	sms->header.type = SYSTEM_SMS;
 	
 	return sms;

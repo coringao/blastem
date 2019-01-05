@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include "serialize.h"
+#include "render.h"
 
 #define NUM_PART_REGS (0xB7-0x30)
 #define NUM_CHANNELS 6
@@ -17,6 +18,7 @@
 #define YM_OPT_WAVE_LOG 1
 
 typedef struct {
+	int16_t  *mod_src[2];
 	uint32_t phase_counter;
 	uint16_t envelope;
 	int16_t  output;
@@ -62,14 +64,8 @@ typedef struct {
 #define YM_PART2_REGS (YM_REG_END-YM_PART2_START)
 
 typedef struct {
-    int16_t     *audio_buffer;
-    int16_t     *back_buffer;
-    uint64_t    buffer_fraction;
-    uint64_t    buffer_inc;
+	audio_source *audio;
     uint32_t    clock_inc;
-    uint32_t    buffer_pos;
-	uint32_t    sample_rate;
-    uint32_t    sample_limit;
 	uint32_t    current_cycle;
 	//TODO: Condense the next two fields into one
 	uint32_t    write_cycle;
@@ -81,8 +77,6 @@ typedef struct {
 	uint16_t    timer_a_load;
 	uint16_t    env_counter;
 	ym_supp     ch3_supp[3];
-	int16_t     last_left;
-	int16_t     last_right;
 	uint8_t     timer_b;
 	uint8_t     sub_timer_b;
 	uint8_t     timer_b_load;
@@ -131,7 +125,7 @@ enum {
 	REG_LR_AMS_PMS   = 0xB4
 };
 
-void ym_init(ym2612_context * context, uint32_t sample_rate, uint32_t master_clock, uint32_t clock_div, uint32_t sample_limit, uint32_t options, uint32_t lowpass_cutoff);
+void ym_init(ym2612_context * context, uint32_t master_clock, uint32_t clock_div, uint32_t options);
 void ym_reset(ym2612_context *context);
 void ym_free(ym2612_context *context);
 void ym_adjust_master_clock(ym2612_context * context, uint32_t master_clock);

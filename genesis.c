@@ -16,6 +16,9 @@
 #include "util.h"
 #include "debug.h"
 #include "gdb_remote.h"
+#include "saves.h"
+#include "bindings.h"
+#include "jcart.h"
 #define MCLKS_NTSC 53693175
 #define MCLKS_PAL  53203395
 
@@ -29,7 +32,7 @@ uint32_t MCLKS_PER_68K;
 
 //TODO: Figure out the exact value for this
 #define LINES_NTSC 262
-#define LINES_PAL 312
+#define LINES_PAL 313
 
 #define MAX_SOUND_CYCLES 100000	
 
@@ -110,7 +113,7 @@ static void zram_deserialize(deserialize_buffer *buf, void *vgen)
 
 static void update_z80_bank_pointer(genesis_context *gen)
 {
-	if (gen->z80->bank_reg < 0x100) {
+	if (gen->z80->bank_reg < 0x140) {
 		gen->z80->mem_pointers[1] = get_native_pointer(gen->z80->bank_reg << 15, (void **)gen->m68k->mem_pointers, &gen->m68k->options->gen);
 	} else {
 		gen->z80->mem_pointers[1] = NULL;
@@ -125,6 +128,7 @@ static void bus_arbiter_deserialize(deserialize_buffer *buf, void *vgen)
 	gen->z80->bank_reg = load_int16(buf) & 0x1FF;
 }
 
+static void adjust_int_cycle(m68k_context * context, vdp_context * v_context);
 void genesis_deserialize(deserialize_buffer *buf, genesis_context *gen)
 {
 	register_section_handler(buf, (section_handler){.fun = m68k_deserialize, .data = gen->m68k}, SECTION_68000);
@@ -144,6 +148,7 @@ void genesis_deserialize(deserialize_buffer *buf, genesis_context *gen)
 		load_section(buf);
 	}
 	update_z80_bank_pointer(gen);
+	adjust_int_cycle(gen->m68k, gen->vdp);
 }
 
 uint16_t read_dma_value(uint32_t address)
@@ -243,6 +248,7 @@ static void z80_next_int_pulse(z80_context * z_context)
 	genesis_context * gen = z_context->system;
 	z_context->int_pulse_start = vdp_next_vint_z80(gen->vdp);
 	z_context->int_pulse_end = z_context->int_pulse_start + Z80_INT_PULSE_MCLKS;
+	z_context->im2_vector = 0xFF;
 }
 
 static void sync_z80(z80_context * z_context, uint32_t mclks)
@@ -307,6 +313,11 @@ m68k_context * sync_components(m68k_context * context, uint32_t address)
 	sync_z80(z_context, mclks);
 	sync_sound(gen, mclks);
 	vdp_run_context(v_context, mclks);
+	if (mclks >= gen->reset_cycle) {
+		gen->reset_requested = 1;
+		context->should_return = 1;
+		gen->reset_cycle = CYCLE_NEVER;
+	}
 	if (v_context->frame != last_frame_num) {
 		//printf("reached frame end %d | MCLK Cycles: %d, Target: %d, VDP cycles: %d, vcounter: %d, hslot: %d\n", last_frame_num, mclks, gen->frame_end, v_context->cycles, v_context->vcounter, v_context->hslot);
 		last_frame_num = v_context->frame;
@@ -323,12 +334,18 @@ m68k_context * sync_components(m68k_context * context, uint32_t address)
 			io_adjust_cycles(gen->io.ports, context->current_cycle, deduction);
 			io_adjust_cycles(gen->io.ports+1, context->current_cycle, deduction);
 			io_adjust_cycles(gen->io.ports+2, context->current_cycle, deduction);
+			if (gen->mapper_type == MAPPER_JCART) {
+				jcart_adjust_cycles(gen, deduction);
+			}
 			context->current_cycle -= deduction;
 			z80_adjust_cycles(z_context, deduction);
 			gen->ym->current_cycle -= deduction;
 			gen->psg->cycles -= deduction;
 			if (gen->ym->write_cycle != CYCLE_NEVER) {
 				gen->ym->write_cycle = gen->ym->write_cycle >= deduction ? gen->ym->write_cycle - deduction : 0;
+			}
+			if (gen->reset_cycle != CYCLE_NEVER) {
+				gen->reset_cycle -= deduction;
 			}
 		}
 	}
@@ -344,6 +361,9 @@ m68k_context * sync_components(m68k_context * context, uint32_t address)
 		context->sync_cycle = context->current_cycle + 1;
 	}
 	adjust_int_cycle(context, v_context);
+	if (gen->reset_cycle < context->target_cycle) {
+		context->target_cycle = gen->reset_cycle;
+	}
 	if (address) {
 		if (gen->header.enter_debugger) {
 			gen->header.enter_debugger = 0;
@@ -359,18 +379,7 @@ m68k_context * sync_components(m68k_context * context, uint32_t address)
 					sync_z80(z_context, z_context->current_cycle + MCLKS_PER_Z80);
 				}
 			}
-			char *save_path;
-			if (slot == QUICK_SAVE_SLOT) {
-				save_path = save_state_path;
-			} else {
-				char slotname[] = "slot_0.state";
-				slotname[5] = '0' + slot;
-				if (!use_native_states) {
-					strcpy(slotname + 7, "gst");
-				}
-				char const *parts[] = {gen->header.save_dir, PATH_SEP, slotname};
-				save_path = alloc_concat_m(3, parts);
-			}
+			char *save_path = get_slot_name(&gen->header, slot, use_native_states ? "state" : "gst");
 			if (use_native_states) {
 				serialize_buffer state;
 				init_serialize(&state);
@@ -381,9 +390,7 @@ m68k_context * sync_components(m68k_context * context, uint32_t address)
 				save_gst(gen, save_path, address);
 			}
 			printf("Saved state to %s\n", save_path);
-			if (slot != QUICK_SAVE_SLOT) {
-				free(save_path);
-			}
+			free(save_path);
 		} else if(gen->header.save_state) {
 			context->sync_cycle = context->current_cycle + 1;
 		}
@@ -1008,37 +1015,24 @@ void set_region(genesis_context *gen, rom_info *info, uint8_t region)
 	gen->master_clock = gen->normal_clock;
 }
 
-static void handle_reset_requests(genesis_context *gen)
-{
-	while (gen->reset_requested)
-	{
-		gen->reset_requested = 0;
-		z80_assert_reset(gen->z80, gen->m68k->current_cycle);
-		z80_clear_busreq(gen->z80, gen->m68k->current_cycle);
-		ym_reset(gen->ym);
-		//Is there any sort of VDP reset?
-		m68k_reset(gen->m68k);
-	}
-	vdp_release_framebuffer(gen->vdp);
-}
-
 #include "m68k_internal.h" //needed for get_native_address_trans, should be eliminated once handling of PC is cleaned up
 static uint8_t load_state(system_header *system, uint8_t slot)
 {
 	genesis_context *gen = (genesis_context *)system;
-	char numslotname[] = "slot_0.state";
-	char *slotname;
-	if (slot == QUICK_SAVE_SLOT) {
-		slotname = "quicksave.state";
-	} else {
-		numslotname[5] = '0' + slot;
-		slotname = numslotname;
-	}
-	char const *parts[] = {gen->header.save_dir, PATH_SEP, slotname};
-	char *statepath = alloc_concat_m(3, parts);
+	char *statepath = get_slot_name(system, slot, "state");
 	deserialize_buffer state;
 	uint32_t pc = 0;
 	uint8_t ret;
+	if (!gen->m68k->resume_pc) {
+		system->delayed_load_slot = slot + 1;
+		gen->m68k->should_return = 1;
+		ret = get_modification_time(statepath) != 0;
+		if (!ret) {
+			strcpy(statepath + strlen(statepath)-strlen("state"), "gst");
+			ret = get_modification_time(statepath) != 0;
+		}
+		goto done;
+	}
 	if (load_from_file(&state, statepath)) {
 		genesis_deserialize(&state, gen);
 		free(state.data);
@@ -1053,15 +1047,39 @@ static uint8_t load_state(system_header *system, uint8_t slot)
 	if (ret) {
 		gen->m68k->resume_pc = get_native_address_trans(gen->m68k, pc);
 	}
+done:
 	free(statepath);
 	return ret;
+}
+
+static void handle_reset_requests(genesis_context *gen)
+{
+	while (gen->reset_requested || gen->header.delayed_load_slot)
+	{
+		if (gen->reset_requested) {
+			gen->reset_requested = 0;
+			gen->m68k->should_return = 0;
+			z80_assert_reset(gen->z80, gen->m68k->current_cycle);
+			z80_clear_busreq(gen->z80, gen->m68k->current_cycle);
+			ym_reset(gen->ym);
+			//Is there any sort of VDP reset?
+			m68k_reset(gen->m68k);
+		}
+		if (gen->header.delayed_load_slot) {
+			load_state(&gen->header, gen->header.delayed_load_slot - 1);
+			gen->header.delayed_load_slot = 0;
+			resume_68k(gen->m68k);
+		}
+	}
+	bindings_release_capture();
+	vdp_release_framebuffer(gen->vdp);
+	render_pause_source(gen->ym->audio);
+	render_pause_source(gen->psg->audio);
 }
 
 static void start_genesis(system_header *system, char *statefile)
 {
 	genesis_context *gen = (genesis_context *)system;
-	set_keybindings(&gen->io);
-	render_set_video_standard((gen->version_reg & HZ50) ? VID_PAL : VID_NTSC);
 	if (statefile) {
 		//first try loading as a native format savestate
 		deserialize_buffer state;
@@ -1100,9 +1118,11 @@ static void start_genesis(system_header *system, char *statefile)
 static void resume_genesis(system_header *system)
 {
 	genesis_context *gen = (genesis_context *)system;
-	map_all_bindings(&gen->io);
 	render_set_video_standard((gen->version_reg & HZ50) ? VID_PAL : VID_NTSC);
+	bindings_reacquire_capture();
 	vdp_reacquire_framebuffer(gen->vdp);
+	render_resume_source(gen->ym->audio);
+	render_resume_source(gen->psg->audio);
 	resume_68k(gen->m68k);
 	handle_reset_requests(gen);
 }
@@ -1110,19 +1130,7 @@ static void resume_genesis(system_header *system)
 static void inc_debug_mode(system_header *system)
 {
 	genesis_context *gen = (genesis_context *)system;
-	gen->vdp->debug++;
-	if (gen->vdp->debug == 7) {
-		gen->vdp->debug = 0;
-	}
-}
-
-static void inc_debug_pal(system_header *system)
-{
-	genesis_context *gen = (genesis_context *)system;
-	gen->vdp->debug_pal++;
-	if (gen->vdp->debug_pal == 4) {
-		gen->vdp->debug_pal = 0;
-	}
+	vdp_inc_debug_mode(gen->vdp);
 }
 
 static void request_exit(system_header *system)
@@ -1163,14 +1171,20 @@ static void load_save(system_header *system)
 static void soft_reset(system_header *system)
 {
 	genesis_context *gen = (genesis_context *)system;
-	gen->m68k->should_return = 1;
-	gen->reset_requested = 1;
+	if (gen->reset_cycle == CYCLE_NEVER) {
+		double random = (double)rand()/(double)RAND_MAX;
+		gen->reset_cycle = gen->m68k->current_cycle + random * MCLKS_LINE * (gen->version_reg & HZ50 ? LINES_PAL : LINES_NTSC);
+		if (gen->reset_cycle < gen->m68k->target_cycle) {
+			gen->m68k->target_cycle = gen->reset_cycle;
+		}
+	}
 }
 
 static void free_genesis(system_header *system)
 {
 	genesis_context *gen = (genesis_context *)system;
 	vdp_free(gen->vdp);
+	memmap_chunk *map = (memmap_chunk *)gen->m68k->options->gen.memmap;
 	m68k_options_free(gen->m68k->options);
 	free(gen->cart);
 	free(gen->m68k);
@@ -1180,10 +1194,70 @@ static void free_genesis(system_header *system)
 	free(gen->zram);
 	ym_free(gen->ym);
 	psg_free(gen->psg);
-	free(gen->save_storage);
 	free(gen->header.save_dir);
+	free_rom_info(&gen->header.info);
 	free(gen->lock_on);
 	free(gen);
+}
+
+static void gamepad_down(system_header *system, uint8_t gamepad_num, uint8_t button)
+{
+	genesis_context *gen = (genesis_context *)system;
+	io_gamepad_down(&gen->io, gamepad_num, button);
+	if (gen->mapper_type == MAPPER_JCART) {
+		jcart_gamepad_down(gen, gamepad_num, button);
+	}
+}
+
+static void gamepad_up(system_header *system, uint8_t gamepad_num, uint8_t button)
+{
+	genesis_context *gen = (genesis_context *)system;
+	io_gamepad_up(&gen->io, gamepad_num, button);
+	if (gen->mapper_type == MAPPER_JCART) {
+		jcart_gamepad_up(gen, gamepad_num, button);
+	}
+}
+
+static void mouse_down(system_header *system, uint8_t mouse_num, uint8_t button)
+{
+	genesis_context *gen = (genesis_context *)system;
+	io_mouse_down(&gen->io, mouse_num, button);
+}
+
+static void mouse_up(system_header *system, uint8_t mouse_num, uint8_t button)
+{
+	genesis_context *gen = (genesis_context *)system;
+	io_mouse_up(&gen->io, mouse_num, button);
+}
+
+static void mouse_motion_absolute(system_header *system, uint8_t mouse_num, uint16_t x, uint16_t y)
+{
+	genesis_context *gen = (genesis_context *)system;
+	io_mouse_motion_absolute(&gen->io, mouse_num, x, y);
+}
+
+static void mouse_motion_relative(system_header *system, uint8_t mouse_num, int32_t x, int32_t y)
+{
+	genesis_context *gen = (genesis_context *)system;
+	io_mouse_motion_relative(&gen->io, mouse_num, x, y);
+}
+
+static void keyboard_down(system_header *system, uint8_t scancode)
+{
+	genesis_context *gen = (genesis_context *)system;
+	io_keyboard_down(&gen->io, scancode);
+}
+
+static void keyboard_up(system_header *system, uint8_t scancode)
+{
+	genesis_context *gen = (genesis_context *)system;
+	io_keyboard_up(&gen->io, scancode);
+}
+
+static void config_updated(system_header *system)
+{
+	genesis_context *gen = (genesis_context *)system;
+	setup_io_devices(config, &system->info, &gen->io);
 }
 
 static genesis_context *shared_init(uint32_t system_opts, rom_info *rom, uint8_t force_region)
@@ -1217,13 +1291,20 @@ static genesis_context *shared_init(uint32_t system_opts, rom_info *rom, uint8_t
 	gen->header.get_open_bus_value = get_open_bus_value;
 	gen->header.request_exit = request_exit;
 	gen->header.inc_debug_mode = inc_debug_mode;
-	gen->header.inc_debug_pal = inc_debug_pal;
+	gen->header.gamepad_down = gamepad_down;
+	gen->header.gamepad_up = gamepad_up;
+	gen->header.mouse_down = mouse_down;
+	gen->header.mouse_up = mouse_up;
+	gen->header.mouse_motion_absolute = mouse_motion_absolute;
+	gen->header.mouse_motion_relative = mouse_motion_relative;
+	gen->header.keyboard_down = keyboard_down;
+	gen->header.keyboard_up = keyboard_up;
+	gen->header.config_updated = config_updated;
 	gen->header.type = SYSTEM_GENESIS;
-	
+	gen->header.info = *rom;
 	set_region(gen, rom, force_region);
 	
-	gen->vdp = malloc(sizeof(vdp_context));
-	init_vdp_context(gen->vdp, gen->version_reg & 0x40);
+	gen->vdp = init_vdp_context(gen->version_reg & 0x40);
 	gen->vdp->system = &gen->header;
 	gen->frame_end = vdp_cycles_to_frame_end(gen->vdp);
 	char * config_cycles = tern_find_path(config, "clocks\0max_cycles\0", TVAL_PTR).ptrval;
@@ -1231,16 +1312,14 @@ static genesis_context *shared_init(uint32_t system_opts, rom_info *rom, uint8_t
 	gen->int_latency_prev1 = MCLKS_PER_68K * 32;
 	gen->int_latency_prev2 = MCLKS_PER_68K * 16;
 	
-	char * lowpass_cutoff_str = tern_find_path(config, "audio\0lowpass_cutoff\0", TVAL_PTR).ptrval;
-	uint32_t lowpass_cutoff = lowpass_cutoff_str ? atoi(lowpass_cutoff_str) : DEFAULT_LOWPASS_CUTOFF;
+	render_set_video_standard((gen->version_reg & HZ50) ? VID_PAL : VID_NTSC);
 	
 	gen->ym = malloc(sizeof(ym2612_context));
-	ym_init(gen->ym, render_sample_rate(), gen->master_clock, MCLKS_PER_YM, render_audio_buffer(), system_opts, lowpass_cutoff);
+	ym_init(gen->ym, gen->master_clock, MCLKS_PER_YM, system_opts);
 
 	gen->psg = malloc(sizeof(psg_context));
-	psg_init(gen->psg, render_sample_rate(), gen->master_clock, MCLKS_PER_PSG, render_audio_buffer(), lowpass_cutoff);
+	psg_init(gen->psg, gen->master_clock, MCLKS_PER_PSG);
 
-	gen->zram = calloc(1, Z80_RAM_BYTES);
 	z80_map[0].buffer = gen->zram = calloc(1, Z80_RAM_BYTES);
 #ifndef NO_Z80
 	z80_options *z_opts = malloc(sizeof(z80_options));
@@ -1298,6 +1377,7 @@ genesis_context *alloc_init_genesis(rom_info *rom, void *main_rom, void *lock_on
 	gen->lock_on = lock_on;
 	
 	setup_io_devices(config, rom, &gen->io);
+	gen->header.has_keyboard = io_has_keyboard(&gen->io);
 	gen->mapper_type = rom->mapper_type;
 	gen->save_type = rom->save_type;
 	if (gen->save_type != SAVE_NONE) {
@@ -1309,7 +1389,8 @@ genesis_context *alloc_init_genesis(rom_info *rom, void *main_rom, void *lock_on
 		if (gen->save_type == SAVE_I2C) {
 			eeprom_init(&gen->eeprom, gen->save_storage, gen->save_size);
 		} else if (gen->save_type == SAVE_NOR) {
-			nor_flash_init(&gen->nor, gen->save_storage, gen->save_size, rom->save_page_size, rom->save_product_id, rom->save_bus);
+			memcpy(&gen->nor, rom->nor, sizeof(gen->nor));
+			//nor_flash_init(&gen->nor, gen->save_storage, gen->save_size, rom->save_page_size, rom->save_product_id, rom->save_bus);
 		}
 	} else {
 		gen->save_storage = NULL;
@@ -1363,32 +1444,43 @@ static memmap_chunk base_map[] = {
 };
 const size_t base_chunks = sizeof(base_map)/sizeof(*base_map); 
 
-genesis_context *alloc_config_genesis(void *rom, uint32_t rom_size, void *lock_on, uint32_t lock_on_size, uint32_t ym_opts, uint8_t force_region, rom_info *info_out)
+genesis_context *alloc_config_genesis(void *rom, uint32_t rom_size, void *lock_on, uint32_t lock_on_size, uint32_t ym_opts, uint8_t force_region)
 {
 	tern_node *rom_db = get_rom_db();
-	*info_out = configure_rom(rom_db, rom, rom_size, lock_on, lock_on_size, base_map, base_chunks);
-	rom = info_out->rom;
-	rom_size = info_out->rom_size;
+	rom_info info = configure_rom(rom_db, rom, rom_size, lock_on, lock_on_size, base_map, base_chunks);
+	rom = info.rom;
+	rom_size = info.rom_size;
 #ifndef BLASTEM_BIG_ENDIAN
 	byteswap_rom(rom_size, rom);
 	if (lock_on) {
 		byteswap_rom(lock_on_size, lock_on);
 	}
 #endif
-	return alloc_init_genesis(info_out, rom, lock_on, ym_opts, force_region);
+	char *m68k_divider = tern_find_path(config, "clocks\0m68k_divider\0", TVAL_PTR).ptrval;
+	if (!m68k_divider) {
+		m68k_divider = "7";
+	}
+	MCLKS_PER_68K = atoi(m68k_divider);
+	if (!MCLKS_PER_68K) {
+		MCLKS_PER_68K = 7;
+	}
+	return alloc_init_genesis(&info, rom, lock_on, ym_opts, force_region);
 }
 
-genesis_context *alloc_config_genesis_cdboot(system_media *media, uint32_t system_opts, uint8_t force_region, rom_info *info_out)
+genesis_context *alloc_config_genesis_cdboot(system_media *media, uint32_t system_opts, uint8_t force_region)
 {
-	segacd_context *cd = alloc_configure_segacd(media, system_opts, force_region, info_out);
-	genesis_context *gen = shared_init(system_opts, info_out, force_region);
+	tern_node *rom_db = get_rom_db();
+	rom_info info = configure_rom(rom_db, media->buffer, media->size, NULL, 0, base_map, base_chunks);
+	
+	segacd_context *cd = alloc_configure_segacd(media, system_opts, force_region, &info);
+	genesis_context *gen = shared_init(system_opts, &info, force_region);
 	gen->cart = gen->lock_on = NULL;
 	gen->save_storage = NULL;
 	gen->save_type = SAVE_NONE;
 	gen->version_reg &= ~NO_DISK;
 	
 	gen->expansion = cd;
-	setup_io_devices(config, info_out, &gen->io);
+	setup_io_devices(config, &info, &gen->io);
 	
 	uint32_t cd_chunks;
 	memmap_chunk *cd_map = segacd_main_cpu_map(gen->expansion, &cd_chunks);

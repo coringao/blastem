@@ -468,7 +468,11 @@ static code_ptr get_movem_impl(m68k_options *opts, m68kinst *inst)
 		}
 	}
 	if (opts->num_movem == opts->movem_storage) {
-		opts->movem_storage *= 2;
+		if (!opts->movem_storage) {
+			opts->movem_storage = 4;
+		} else {
+			opts->movem_storage *= 2;
+		}
 		opts->big_movem = realloc(opts->big_movem, sizeof(movem_fun) * opts->movem_storage);
 	}
 	if (!opts->extra_code.cur) {
@@ -902,7 +906,7 @@ static impl_info m68k_impls[] = {
 	RAW_IMPL(M68K_MOVE_USP, translate_m68k_move_usp),
 	RAW_IMPL(M68K_LEA, translate_m68k_lea_pea),
 	RAW_IMPL(M68K_PEA, translate_m68k_lea_pea),
-	RAW_IMPL(M68K_CLR, translate_m68k_clr),
+	UNARY_IMPL(M68K_CLR, N0|V0|C0|Z1),
 	OP_IMPL(M68K_EXG, translate_m68k_exg),
 	RAW_IMPL(M68K_SCC, translate_m68k_scc),
 
@@ -1168,7 +1172,6 @@ void start_68k_context(m68k_context * context, uint32_t address)
 {
 	code_ptr addr = get_native_address_trans(context, address);
 	m68k_options * options = context->options;
-	context->should_return = 0;
 	options->start_context(addr, context);
 }
 
@@ -1192,8 +1195,21 @@ void m68k_reset(m68k_context * context)
 
 void m68k_options_free(m68k_options *opts)
 {
+	for (uint32_t address = 0; address < opts->gen.address_mask; address += NATIVE_CHUNK_SIZE)
+	{
+		uint32_t chunk = address / NATIVE_CHUNK_SIZE;
+		if (opts->gen.native_code_map[chunk].base) {
+			free(opts->gen.native_code_map[chunk].offsets);
+		}
+	}
 	free(opts->gen.native_code_map);
+	uint32_t ram_inst_slots = ram_size(&opts->gen) / 1024;
+	for (uint32_t i = 0; i < ram_inst_slots; i++)
+	{
+		free(opts->gen.ram_inst_sizes[i]);
+	}
 	free(opts->gen.ram_inst_sizes);
+	free(opts->big_movem);
 	free(opts);
 }
 

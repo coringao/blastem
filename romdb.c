@@ -11,6 +11,9 @@
 #include "nor.h"
 #include "sega_mapper.h"
 #include "multi_game.h"
+#include "megawifi.h"
+#include "jcart.h"
+#include "blastem.h"
 
 #define DOM_TITLE_START 0x120
 #define DOM_TITLE_END 0x150
@@ -52,6 +55,8 @@ void free_rom_info(rom_info *info)
 		free(info->save_buffer);
 		if (info->save_type == SAVE_I2C) {
 			free(info->eeprom_map);
+		} else if (info->save_type == SAVE_NOR) {
+			free(info->nor);
 		}
 	}
 	free(info->map);
@@ -502,15 +507,15 @@ void process_nor_def(char *key, map_iter_state *state)
 		if (!page_size) {
 			fatal_error("ROM DB map entry %d with address %s has device type NOR, but the NOR page size is not defined\n", state->index, key);
 		}
-		state->info->save_page_size = atoi(size);
-		if (!state->info->save_page_size) {
-			fatal_error("NOR page size %s is invalid\n", size);
+		uint32_t save_page_size = atoi(page_size);
+		if (!save_page_size) {
+			fatal_error("NOR page size %s is invalid\n", page_size);
 		}
 		char *product_id = tern_find_path(state->root, "NOR\0product_id\0", TVAL_PTR).ptrval;
 		if (!product_id) {
 			fatal_error("ROM DB map entry %d with address %s has device type NOR, but the NOR product ID is not defined\n", state->index, key);
 		}
-		state->info->save_product_id = strtol(product_id, NULL, 16);
+		uint16_t save_product_id = strtol(product_id, NULL, 16);
 		char *bus = tern_find_path(state->root, "NOR\0bus\0", TVAL_PTR).ptrval;
 		if (!strcmp(bus, "odd")) {
 			state->info->save_bus = RAM_FLAG_ODD;
@@ -521,7 +526,26 @@ void process_nor_def(char *key, map_iter_state *state)
 		}
 		state->info->save_type = SAVE_NOR;
 		state->info->save_buffer = malloc(state->info->save_size);
-		memset(state->info->save_buffer, 0xFF, state->info->save_size);
+		char *init = tern_find_path_default(state->root, "NOR\0init\0", (tern_val){.ptrval="FF"}, TVAL_PTR).ptrval;
+		if (!strcmp(init, "ROM")) {
+			uint32_t init_size = state->rom_size > state->info->save_size ? state->info->save_size : state->rom_size;
+			memcpy(state->info->save_buffer, state->rom, init_size);
+			if (state->info->save_bus == RAM_FLAG_BOTH) {
+				byteswap_rom(state->info->save_size, (uint16_t *)state->info->save_buffer);
+			}
+		} else {
+			memset(state->info->save_buffer, strtol(init, NULL, 16), state->info->save_size);
+		}
+		state->info->nor = calloc(1, sizeof(nor_state));
+		nor_flash_init(state->info->nor, state->info->save_buffer, state->info->save_size, save_page_size, save_product_id, state->info->save_bus);
+		char *cmd1 = tern_find_path(state->root, "NOR\0cmd_address1\0", TVAL_PTR).ptrval;
+		if (cmd1) {
+			state->info->nor->cmd_address1 = strtol(cmd1, NULL, 16);
+		}
+		char *cmd2 = tern_find_path(state->root, "NOR\0cmd_address2\0", TVAL_PTR).ptrval;
+		if (cmd2) {
+			state->info->nor->cmd_address2 = strtol(cmd2, NULL, 16);
+		}
 	}
 }
 
@@ -562,8 +586,12 @@ void map_iter_fun(char *key, tern_val val, uint8_t valtype, void *data)
 	map->end = end + 1;
 	if (!strcmp(dtype, "ROM")) {
 		map->buffer = state->rom + offset;
-		map->flags = MMAP_READ;
 		map->mask = calc_mask(state->rom_size - offset, start, end);
+		if (strcmp(tern_find_ptr_default(node, "writeable", "no"), "yes")) {
+			map->flags = MMAP_READ;
+		} else {
+			map->flags = MMAP_READ | MMAP_WRITE | MMAP_CODE;
+		}
 	} else if (!strcmp(dtype, "LOCK-ON")) {
 		rom_info lock_info;
 		if (state->lock_on) {
@@ -584,6 +612,7 @@ void map_iter_fun(char *key, tern_val val, uint8_t valtype, void *data)
 		}
 		if (matching_chunks == 0) {
 			//Nothing mapped in the relevant range for the lock-on cart, ignore this mapping
+			free_rom_info(&lock_info);
 			return;
 		} else if (matching_chunks > 1) {
 			state->info->map_chunks += matching_chunks - 1;
@@ -614,8 +643,7 @@ void map_iter_fun(char *key, tern_val val, uint8_t valtype, void *data)
 			state->info->save_buffer = lock_info.save_buffer;
 			state->info->save_size = lock_info.save_size;
 			state->info->save_mask = lock_info.save_mask;
-			state->info->save_page_size = lock_info.save_page_size;
-			state->info->save_product_id = lock_info.save_product_id;
+			state->info->nor = lock_info.nor;
 			state->info->save_type = lock_info.save_type;
 			state->info->save_bus = lock_info.save_bus;
 			lock_info.save_buffer = NULL;
@@ -665,6 +693,10 @@ void map_iter_fun(char *key, tern_val val, uint8_t valtype, void *data)
 		map->write_8 = nor_flash_write_b;
 		map->read_16 = nor_flash_read_w;
 		map->read_8 = nor_flash_read_b;
+		if (state->info->save_bus == RAM_FLAG_BOTH) {
+			map->flags |= MMAP_READ_CODE | MMAP_CODE;
+			map->buffer = state->info->save_buffer;
+		}
 		map->mask = 0xFFFFFF;
 	} else if (!strcmp(dtype, "Sega mapper")) {
 		state->info->mapper_type = MAPPER_SEGA;
@@ -777,6 +809,27 @@ void map_iter_fun(char *key, tern_val val, uint8_t valtype, void *data)
 		map->mask = 0xFF;
 		map->write_16 = write_multi_game_w;
 		map->write_8 = write_multi_game_b;
+	} else if (!strcmp(dtype, "megawifi")) {
+		if (!strcmp(
+			"on", 
+			tern_find_path_default(config, "system\0megawifi\0", (tern_val){.ptrval="off"}, TVAL_PTR).ptrval)
+		) {
+			map->write_16 = megawifi_write_w;
+			map->write_8 = megawifi_write_b;
+			map->read_16 = megawifi_read_w;
+			map->read_8 = megawifi_read_b;
+			map->mask = 0xFFFFFF;
+		} else {
+			warning("ROM uses MegaWiFi, but it is disabled\n");
+			return;
+		}
+	} else if (!strcmp(dtype, "jcart")) {
+		state->info->mapper_type = MAPPER_JCART;
+		map->write_16 = jcart_write_w;
+		map->write_8 = jcart_write_b;
+		map->read_16 = jcart_read_w;
+		map->read_8 = jcart_read_b;
+		map->mask = 0xFFFFFF;
 	} else {
 		fatal_error("Invalid device type %s for ROM DB map entry %d with address %s\n", dtype, state->index, key);
 	}

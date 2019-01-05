@@ -2075,7 +2075,7 @@ void translate_z80inst(z80inst * inst, z80_context * context, uint16_t address, 
 		break;
 	}
 	case Z80_JPCC: {
-		cycles(&opts->gen, num_cycles + 3);//T States: 4,3
+		cycles(&opts->gen, num_cycles + 6);//T States: 4,3,3
 		uint8_t cond = CC_Z;
 		switch (inst->reg)
 		{
@@ -2102,7 +2102,6 @@ void translate_z80inst(z80inst * inst, z80_context * context, uint16_t address, 
 		}
 		uint8_t *no_jump_off = code->cur+1;
 		jcc(code, cond, code->cur+2);
-		cycles(&opts->gen, 5);//T States: 5
 		uint16_t dest_addr = inst->immed;
 		code_ptr call_dst = z80_get_native_address(context, dest_addr);
 			if (!call_dst) {
@@ -3454,15 +3453,43 @@ void init_z80_opts(z80_options * options, memmap_chunk const * chunks, uint32_t 
 	cmp_irdisp(code, 0, options->gen.context_reg, offsetof(z80_context, int_is_nmi), SZ_B);
 	is_nmi = code->cur + 1;
 	jcc(code, CC_NZ, is_nmi);
-	//TODO: Support interrupt mode 0 and 2
+	cycles(&options->gen, 6); //interupt ack cycle
+	//TODO: Support interrupt mode 0, not needed for Genesis sit it seems to read $FF during intack
+	//which is conveniently rst $38, i.e. the same thing that im 1 does
+	//check interrupt mode
+	cmp_irdisp(code, 2, options->gen.context_reg, offsetof(z80_context, im), SZ_B);
+	code_ptr im2 = code->cur + 1;
+	jcc(code, CC_Z, im2);
 	mov_ir(code, 0x38, options->gen.scratch1, SZ_W);
 	code_ptr after_int_dest = code->cur + 1;
 	jmp(code, after_int_dest);
+	*im2 = code->cur - (im2 + 1);
+	//read vector address from I << 8 | vector
+	mov_rdispr(code, options->gen.context_reg, offsetof(z80_context, regs) + Z80_I, options->gen.scratch1, SZ_B);
+	shl_ir(code, 8, options->gen.scratch1, SZ_W);
+	movzx_rdispr(code, options->gen.context_reg, offsetof(z80_context, im2_vector), options->gen.scratch2, SZ_B, SZ_W);
+	or_rr(code, options->gen.scratch2, options->gen.scratch1, SZ_W);
+	push_r(code, options->gen.scratch1);
+	cycles(&options->gen, 3);
+	call(code, options->read_8_noinc);
+	pop_r(code, options->gen.scratch2);
+	push_r(code, options->gen.scratch1);
+	mov_rr(code, options->gen.scratch2, options->gen.scratch1, SZ_W);
+	add_ir(code, 1, options->gen.scratch1, SZ_W);
+	cycles(&options->gen, 3);
+	call(code, options->read_8_noinc);
+	pop_r(code, options->gen.scratch2);
+	shl_ir(code, 8, options->gen.scratch1, SZ_W);
+	movzx_rr(code, options->gen.scratch2, options->gen.scratch2, SZ_B, SZ_W);
+	or_rr(code, options->gen.scratch2, options->gen.scratch1, SZ_W);
+	code_ptr after_int_dest2 = code->cur + 1;
+	jmp(code, after_int_dest2);
 	*is_nmi = code->cur - (is_nmi + 1);
 	mov_irdisp(code, 0, options->gen.context_reg, offsetof(z80_context, int_is_nmi), SZ_B);
 	mov_irdisp(code, CYCLE_NEVER, options->gen.context_reg, offsetof(z80_context, nmi_start), SZ_D);
 	mov_ir(code, 0x66, options->gen.scratch1, SZ_W);
 	*after_int_dest = code->cur - (after_int_dest + 1);
+	*after_int_dest2 = code->cur - (after_int_dest2 + 1);
 	call(code, options->native_addr);
 	mov_rrind(code, options->gen.scratch1, options->gen.context_reg, SZ_PTR);
 	tmp_stack_off = code->stack_off;
@@ -3644,7 +3671,19 @@ void z80_run(z80_context * context, uint32_t target_cycle)
 
 void z80_options_free(z80_options *opts)
 {
+	for (uint32_t address = 0; address < opts->gen.address_mask; address += NATIVE_CHUNK_SIZE)
+	{
+		uint32_t chunk = address / NATIVE_CHUNK_SIZE;
+		if (opts->gen.native_code_map[chunk].base) {
+			free(opts->gen.native_code_map[chunk].offsets);
+		}
+	}
 	free(opts->gen.native_code_map);
+	uint32_t ram_inst_slots = ram_size(&opts->gen) / 1024;
+	for (uint32_t i = 0; i < ram_inst_slots; i++)
+	{
+		free(opts->gen.ram_inst_sizes[i]);
+	}
 	free(opts->gen.ram_inst_sizes);
 	free(opts);
 }

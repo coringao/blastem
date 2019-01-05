@@ -5,7 +5,6 @@
 */
 #include "vdp.h"
 #include "blastem.h"
-#include "genesis.h"
 #include <stdlib.h>
 #include <string.h>
 #include "render.h"
@@ -19,7 +18,6 @@
 #define MAP_BIT_H_FLIP 0x800
 #define MAP_BIT_V_FLIP 0x1000
 
-#define SCROLL_BUFFER_SIZE 32
 #define SCROLL_BUFFER_MASK (SCROLL_BUFFER_SIZE-1)
 #define SCROLL_BUFFER_DRAW (SCROLL_BUFFER_SIZE/2)
 
@@ -138,13 +136,9 @@ static void update_video_params(vdp_context *context)
 
 static uint8_t color_map_init_done;
 
-void init_vdp_context(vdp_context * context, uint8_t region_pal)
+vdp_context *init_vdp_context(uint8_t region_pal)
 {
-	memset(context, 0, sizeof(*context));
-	context->vdpmem = malloc(VRAM_SIZE);
-	memset(context->vdpmem, 0, VRAM_SIZE);
-	/*
-	*/
+	vdp_context *context = calloc(1, sizeof(vdp_context) + VRAM_SIZE);
 	if (headless) {
 		context->output = malloc(LINEBUF_SIZE * sizeof(uint32_t));
 		context->output_pitch = 0;
@@ -152,10 +146,6 @@ void init_vdp_context(vdp_context * context, uint8_t region_pal)
 		context->cur_buffer = FRAMEBUFFER_ODD;
 		context->fb = render_get_framebuffer(FRAMEBUFFER_ODD, &context->output_pitch);
 	}
-	context->linebuf = malloc(LINEBUF_SIZE + SCROLL_BUFFER_SIZE*2);
-	memset(context->linebuf, 0, LINEBUF_SIZE + SCROLL_BUFFER_SIZE*2);
-	context->tmp_buf_a = context->linebuf + LINEBUF_SIZE;
-	context->tmp_buf_b = context->tmp_buf_a + SCROLL_BUFFER_SIZE;
 	context->sprite_draws = MAX_DRAWS;
 	context->fifo_write = 0;
 	context->fifo_read = -1;
@@ -250,12 +240,11 @@ void init_vdp_context(vdp_context * context, uint8_t region_pal)
 	if (!headless) {
 		context->output = (uint32_t *)(((char *)context->fb) + context->output_pitch * context->border_top);
 	}
+	return context;
 }
 
 void vdp_free(vdp_context *context)
 {
-	free(context->vdpmem);
-	free(context->linebuf);
 	free(context);
 }
 
@@ -528,6 +517,8 @@ void vdp_print_reg_explain(vdp_context * context)
 		   context->regs[REG_DMASRC_H],
 		       context->regs[REG_DMASRC_H] << 17 | context->regs[REG_DMASRC_M] << 9 | context->regs[REG_DMASRC_L] << 1,
 			   src_types[context->regs[REG_DMASRC_H] >> 6 & 3]);
+	uint8_t old_flags = context->flags;
+	uint8_t old_flags2 = context->flags2;
 	printf("\n**Internal Group**\n"
 	       "Address: %X\n"
 	       "CD:      %X - %s\n"
@@ -541,8 +532,9 @@ void vdp_print_reg_explain(vdp_context * context)
 		   (context->flags & FLAG_PENDING) ? "word" : (context->flags2 & FLAG2_BYTE_PENDING) ? "byte" : "none",
 		   context->vcounter, context->hslot*2, (context->flags2 & FLAG2_VINT_PENDING) ? "true" : "false",
 		   (context->flags2 & FLAG2_HINT_PENDING) ? "true" : "false", vdp_control_port_read(context));
-
-	//TODO: Window Group, DMA Group
+	//restore flags as calling vdp_control_port_read can change them
+	context->flags = old_flags;
+	context->flags2 = old_flags2;
 }
 
 static uint8_t is_active(vdp_context *context)
@@ -778,9 +770,9 @@ static void read_sprite_x_mode4(vdp_context * context)
 static void update_color_map(vdp_context *context, uint16_t index, uint16_t value)
 {
 	context->colors[index] = color_map[value & CRAM_BITS];
-	context->colors[index + CRAM_SIZE] = color_map[(value & CRAM_BITS) | FBUF_SHADOW];
-	context->colors[index + CRAM_SIZE*2] = color_map[(value & CRAM_BITS) | FBUF_HILIGHT];
-	context->colors[index + CRAM_SIZE*3] = color_map[(value & CRAM_BITS) | FBUF_MODE4];
+	context->colors[index + SHADOW_OFFSET] = color_map[(value & CRAM_BITS) | FBUF_SHADOW];
+	context->colors[index + HIGHLIGHT_OFFSET] = color_map[(value & CRAM_BITS) | FBUF_HILIGHT];
+	context->colors[index + MODE4_OFFSET] = color_map[(value & CRAM_BITS) | FBUF_MODE4];
 }
 
 void write_cram_internal(vdp_context * context, uint16_t addr, uint16_t value)
@@ -806,7 +798,7 @@ static void write_cram(vdp_context * context, uint16_t address, uint16_t value)
 	)) {
 		uint8_t bg_end_slot = BG_START_SLOT + (context->regs[REG_MODE_4] & BIT_H40) ? LINEBUF_SIZE/2 : (256+HORIZ_BORDER)/2;
 		if (context->hslot < bg_end_slot) {
-			uint32_t color = (context->regs[REG_MODE_2] & BIT_MODE_5) ? context->colors[addr] : context->colors[addr + CRAM_SIZE*3];
+			uint32_t color = (context->regs[REG_MODE_2] & BIT_MODE_5) ? context->colors[addr] : context->colors[addr + MODE4_OFFSET];
 			context->output[(context->hslot - BG_START_SLOT)*2 + 1] = color;
 		}
 	}
@@ -875,14 +867,17 @@ static void write_vram_byte(vdp_context *context, uint32_t address, uint8_t valu
 	context->vdpmem[address] = value;
 }
 
+#define DMA_FILL 0x80
+#define DMA_COPY 0xC0
+#define DMA_TYPE_MASK 0xC0
 static void external_slot(vdp_context * context)
 {
-	if ((context->flags & FLAG_DMA_RUN) && (context->regs[REG_DMASRC_H] & 0xC0) == 0x80 && context->fifo_read < 0) {
+	if ((context->flags & FLAG_DMA_RUN) && (context->regs[REG_DMASRC_H] & DMA_TYPE_MASK) == DMA_FILL && context->fifo_read < 0) {
 		context->fifo_read = (context->fifo_write-1) & (FIFO_SIZE-1);
 		fifo_entry * cur = context->fifo + context->fifo_read;
 		cur->cycle = context->cycles;
 		cur->address = context->address;
-		cur->partial = 2;
+		cur->partial = 1;
 		vdp_advance_dma(context);
 	}
 	fifo_entry * start = context->fifo + context->fifo_read;
@@ -893,20 +888,16 @@ static void external_slot(vdp_context * context)
 			if ((context->regs[REG_MODE_2] & (BIT_128K_VRAM|BIT_MODE_5)) == (BIT_128K_VRAM|BIT_MODE_5)) {
 				vdp_check_update_sat(context, start->address, start->value);
 				write_vram_word(context, start->address, start->value);
-			} else if (start->partial) {
-				//printf("VRAM Write: %X to %X at %d (line %d, slot %d)\n", start->value, start->address ^ 1, context->cycles, context->cycles/MCLKS_LINE, (context->cycles%MCLKS_LINE)/16);
-				uint8_t byte = start->partial == 2 ? start->value >> 8 : start->value;
-				if (start->partial > 1) {
-					vdp_check_update_sat_byte(context, start->address ^ 1, byte);
-				}
-				write_vram_byte(context, start->address ^ 1, byte);
 			} else {
-				//printf("VRAM Write High: %X to %X at %d (line %d, slot %d)\n", start->value >> 8, start->address, context->cycles, context->cycles/MCLKS_LINE, (context->cycles%MCLKS_LINE)/16);
-				vdp_check_update_sat(context, start->address, start->value);
-				write_vram_byte(context, start->address, start->value >> 8);
-				start->partial = 1;
-				//skip auto-increment and removal of entry from fifo
-				return;
+				uint8_t byte = start->partial == 1 ? start->value >> 8 : start->value;
+				vdp_check_update_sat_byte(context, start->address ^ 1, byte);
+				write_vram_byte(context, start->address ^ 1, byte);
+				if (!start->partial) {
+					start->address = start->address ^ 1;
+					start->partial = 1;
+					//skip auto-increment and removal of entry from fifo
+					return;
+				}
 			}
 			break;
 		case CRAM_WRITE: {
@@ -921,7 +912,7 @@ static void external_slot(vdp_context * context)
 				}
 				write_cram(context, start->address, val);
 			} else {
-				write_cram(context, start->address, start->partial == 2 ? context->fifo[context->fifo_write].value : start->value);
+				write_cram(context, start->address, start->partial ? context->fifo[context->fifo_write].value : start->value);
 			}
 			break;
 		}
@@ -937,7 +928,7 @@ static void external_slot(vdp_context * context)
 						context->vsram[(start->address/2) & 63] |= start->value;
 					}
 				} else {
-					context->vsram[(start->address/2) & 63] = start->partial == 2 ? context->fifo[context->fifo_write].value : start->value;
+					context->vsram[(start->address/2) & 63] = start->partial ? context->fifo[context->fifo_write].value : start->value;
 				}
 			}
 
@@ -945,12 +936,12 @@ static void external_slot(vdp_context * context)
 		}
 		context->fifo_read = (context->fifo_read+1) & (FIFO_SIZE-1);
 		if (context->fifo_read == context->fifo_write) {
-			if ((context->cd & 0x20) && (context->regs[REG_DMASRC_H] & 0xC0) == 0x80) {
+			if ((context->cd & 0x20) && (context->regs[REG_DMASRC_H] & DMA_TYPE_MASK) == DMA_FILL) {
 				context->flags |= FLAG_DMA_RUN;
 			}
 			context->fifo_read = -1;
 		}
-	} else if ((context->flags & FLAG_DMA_RUN) && (context->regs[REG_DMASRC_H] & 0xC0) == 0xC0) {
+	} else if ((context->flags & FLAG_DMA_RUN) && (context->regs[REG_DMASRC_H] & DMA_TYPE_MASK) == DMA_COPY) {
 		if (context->flags & FLAG_READ_FETCHED) {
 			write_vram_byte(context, context->address ^ 1, context->prefetch);
 			
@@ -1217,23 +1208,31 @@ static void render_map(uint16_t col, uint8_t * tmp_buf, uint8_t offset, vdp_cont
 	} else {
 		address += 4 * context->v_offset;
 	}
-	uint16_t pal_priority = (col >> 9) & 0x70;
-	int32_t dir;
+	uint8_t pal_priority = (col >> 9) & 0x70;
+	uint32_t bits = *((uint32_t *)(&context->vdpmem[address]));
 	if (col & MAP_BIT_H_FLIP) {
-		offset += 7;
-		offset &= SCROLL_BUFFER_MASK;
-		dir = -1;
+		uint32_t shift = 28;
+		for (int i = 0; i < 4; i++)
+		{
+			uint8_t right = pal_priority | ((bits >> shift) & 0xF);
+			shift -= 4;
+			tmp_buf[offset++] = pal_priority | ((bits >> shift) & 0xF);
+			shift -= 4;
+			offset &= SCROLL_BUFFER_MASK;
+			tmp_buf[offset++] = right;
+			offset &= SCROLL_BUFFER_MASK;
+		}
 	} else {
-		dir = 1;
-	}
-	for (uint32_t i=0; i < 4; i++, address++)
-	{
-		tmp_buf[offset] = pal_priority | (context->vdpmem[address] >> 4);
-		offset += dir;
-		offset &= SCROLL_BUFFER_MASK;
-		tmp_buf[offset] = pal_priority | (context->vdpmem[address] & 0xF);
-		offset += dir;
-		offset &= SCROLL_BUFFER_MASK;
+		for (int i = 0; i < 4; i++)
+		{
+			uint8_t right = pal_priority | (bits & 0xF);
+			bits >>= 4;
+			tmp_buf[offset++] = pal_priority | (bits & 0xF);
+			offset &= SCROLL_BUFFER_MASK;
+			bits >>= 4;
+			tmp_buf[offset++] = right;
+			offset &= SCROLL_BUFFER_MASK;
+		}
 	}
 }
 
@@ -1272,9 +1271,318 @@ static void fetch_map_mode4(uint16_t col, uint32_t line, vdp_context *context)
 	context->fetch_tmp[1] = context->vdpmem[address+1];
 }
 
+static uint8_t composite_normal(vdp_context *context, uint8_t *debug_dst, uint8_t sprite, uint8_t plane_a, uint8_t plane_b, uint8_t bg_index)
+{
+	uint8_t pixel = bg_index;
+	uint8_t src = DBG_SRC_BG;
+	if (plane_b & 0xF) {
+		pixel = plane_b;
+		src = DBG_SRC_B;
+	}
+	if (plane_a & 0xF && (plane_a & BUF_BIT_PRIORITY) >= (pixel & BUF_BIT_PRIORITY)) {
+		pixel = plane_a;
+		src = DBG_SRC_A;
+	}
+	if (sprite & 0xF && (sprite & BUF_BIT_PRIORITY) >= (pixel & BUF_BIT_PRIORITY)) {
+		pixel = sprite;
+		src = DBG_SRC_S;
+	}
+	*debug_dst = src;
+	return pixel;
+}
+typedef struct {
+	uint8_t index, intensity;
+} sh_pixel;
+
+static sh_pixel composite_highlight(vdp_context *context, uint8_t *debug_dst, uint8_t sprite, uint8_t plane_a, uint8_t plane_b, uint8_t bg_index)
+{
+	uint8_t pixel = bg_index;
+	uint8_t src = DBG_SRC_BG;
+	uint8_t intensity = 0;
+	if (plane_b & 0xF) {
+		pixel = plane_b;
+		src = DBG_SRC_B;
+	}
+	intensity = plane_b & BUF_BIT_PRIORITY;
+	if (plane_a & 0xF && (plane_a & BUF_BIT_PRIORITY) >= (pixel & BUF_BIT_PRIORITY)) {
+		pixel = plane_a;
+		src = DBG_SRC_A;
+	}
+	intensity |= plane_a & BUF_BIT_PRIORITY;
+	if (sprite & 0xF && (sprite & BUF_BIT_PRIORITY) >= (pixel & BUF_BIT_PRIORITY)) {
+		if ((sprite & 0x3F) == 0x3E) {
+			intensity += BUF_BIT_PRIORITY;
+		} else if ((sprite & 0x3F) == 0x3F) {
+			intensity = 0;
+		} else {
+			pixel = sprite;
+			src = DBG_SRC_S;
+			if ((pixel & 0xF) == 0xE) {
+				intensity = BUF_BIT_PRIORITY;
+			} else {
+				intensity |= pixel & BUF_BIT_PRIORITY;
+			}
+		}
+	}
+	*debug_dst = src;
+	return (sh_pixel){.index = pixel, .intensity = intensity};
+}
+
+static void render_normal(vdp_context *context, int32_t col, uint32_t *dst, uint8_t *debug_dst, int plane_a_off, int plane_b_off)
+{
+	int start = 0;
+	if (!col && (context->regs[REG_MODE_1] & BIT_COL0_MASK)) {
+		uint32_t bgcolor = context->colors[context->regs[REG_BG_COLOR] & 0x3F];
+		for (int i = 0; i < 8; ++i)
+		{
+			*(dst++) = bgcolor;
+			*(debug_dst++) = DBG_SRC_BG;
+		}
+		start = 8;
+	}
+	uint8_t *sprite_buf = context->linebuf + col * 8 + start;
+	for (int i = start; i < 16; ++plane_a_off, ++plane_b_off, ++sprite_buf, ++i)
+	{
+		uint8_t sprite, plane_a, plane_b;
+		plane_a = context->tmp_buf_a[plane_a_off & SCROLL_BUFFER_MASK];
+		plane_b = context->tmp_buf_b[plane_b_off & SCROLL_BUFFER_MASK];
+		sprite = *sprite_buf;
+		uint8_t pixel = composite_normal(context, debug_dst, sprite, plane_a, plane_b, context->regs[REG_BG_COLOR]);
+		debug_dst++;
+		*(dst++) = context->colors[pixel & 0x3F];
+	}
+}
+
+static void render_highlight(vdp_context *context, int32_t col, uint32_t *dst, uint8_t *debug_dst, int plane_a_off, int plane_b_off)
+{
+	int start = 0;
+	if (!col && (context->regs[REG_MODE_1] & BIT_COL0_MASK)) {
+		uint32_t bgcolor = context->colors[SHADOW_OFFSET + (context->regs[REG_BG_COLOR] & 0x3F)];
+		for (int i = 0; i < 8; ++i)
+		{
+			*(dst++) = bgcolor;
+			*(debug_dst++) = DBG_SRC_BG | DBG_SHADOW;
+		}
+		start = 8;
+	}
+	uint8_t *sprite_buf = context->linebuf + col * 8 + start;
+	for (int i = start; i < 16; ++plane_a_off, ++plane_b_off, ++sprite_buf, ++i)
+	{
+		uint8_t sprite, plane_a, plane_b;
+		plane_a = context->tmp_buf_a[plane_a_off & SCROLL_BUFFER_MASK];
+		plane_b = context->tmp_buf_b[plane_b_off & SCROLL_BUFFER_MASK];
+		sprite = *sprite_buf;
+		sh_pixel pixel = composite_highlight(context, debug_dst, sprite, plane_a, plane_b, context->regs[REG_BG_COLOR]);
+		uint32_t *colors;
+		if (pixel.intensity == BUF_BIT_PRIORITY << 1) {
+			colors = context->colors + HIGHLIGHT_OFFSET;
+		} else if (pixel.intensity) {
+			colors = context->colors;
+		} else {
+			colors = context->colors + SHADOW_OFFSET;
+		}
+		debug_dst++;
+		*(dst++) = colors[pixel.index & 0x3F];
+	}
+}
+
+static void render_testreg(vdp_context *context, int32_t col, uint32_t *dst, uint8_t *debug_dst, int plane_a_off, int plane_b_off, uint8_t output_disabled, uint8_t test_layer)
+{
+	if (output_disabled) {
+		switch (test_layer)
+		{
+		case 0:
+			for (int i = 0; i < 16; i++)
+			{
+				*(dst++) = 0x3F; //TODO: confirm this on hardware
+				*(debug_dst++) = DBG_SRC_BG;
+			}
+			break;
+		case 1: {
+			uint8_t *sprite_buf = context->linebuf + col * 8;
+			for (int i = 0; i < 16; i++)
+			{
+				*(dst++) = context->colors[*(sprite_buf++) & 0x3F];
+				*(debug_dst++) = DBG_SRC_S;
+			}
+			break;
+		}
+		case 2:
+			for (int i = 0; i < 16; i++)
+			{
+				*(dst++) = context->colors[context->tmp_buf_a[(plane_a_off++) & SCROLL_BUFFER_MASK] & 0x3F];
+				*(debug_dst++) = DBG_SRC_A;
+			}
+			break;
+		case 3:
+			for (int i = 0; i < 16; i++)
+			{
+				*(dst++) = context->colors[context->tmp_buf_b[(plane_b_off++) & SCROLL_BUFFER_MASK] & 0x3F];
+				*(debug_dst++) = DBG_SRC_B;
+			}
+			break;
+		}
+	} else {
+		int start = 0;
+		uint8_t *sprite_buf = context->linebuf + col * 8;
+		if (!col && (context->regs[REG_MODE_1] & BIT_COL0_MASK)) {
+			//TODO: Confirm how test register interacts with column 0 blanking
+			uint8_t pixel = context->regs[REG_BG_COLOR] & 0x3F;
+			uint8_t src = DBG_SRC_BG;
+			for (int i = 0; i < 8; ++i)
+			{
+				switch (test_layer)
+				{
+				case 1:
+					pixel &= sprite_buf[i];
+					if (pixel) {
+						src = DBG_SRC_S;
+					}
+					break;
+				case 2:
+					pixel &= context->tmp_buf_a[(plane_a_off + i) & SCROLL_BUFFER_MASK];
+					if (pixel) {
+						src = DBG_SRC_A;
+					}
+					break;
+				case 3:
+					pixel &= context->tmp_buf_b[(plane_b_off + i) & SCROLL_BUFFER_MASK];
+					if (pixel) {
+						src = DBG_SRC_B;
+					}
+					break;
+				}
+				
+				*(dst++) = context->colors[pixel & 0x3F];
+				*(debug_dst++) = src;
+			}
+			plane_a_off += 8;
+			plane_b_off += 8;
+			sprite_buf += 8;
+			start = 8;
+		}
+		for (int i = start; i < 16; ++plane_a_off, ++plane_b_off, ++sprite_buf, ++i)
+		{
+			uint8_t sprite, plane_a, plane_b;
+			plane_a = context->tmp_buf_a[plane_a_off & SCROLL_BUFFER_MASK];
+			plane_b = context->tmp_buf_b[plane_b_off & SCROLL_BUFFER_MASK];
+			sprite = *sprite_buf;
+			uint8_t pixel = composite_normal(context, debug_dst, sprite, plane_a, plane_b, 0x3F);
+			switch (test_layer)
+			{
+			case 1:
+				pixel &= sprite;
+				if (pixel) {
+					*debug_dst = DBG_SRC_S;
+				}
+				break;
+			case 2:
+				pixel &= plane_a;
+				if (pixel) {
+					*debug_dst = DBG_SRC_A;
+				}
+				break;
+			case 3:
+				pixel &= plane_b;
+				if (pixel) {
+					*debug_dst = DBG_SRC_B;
+				}
+				break;
+			}
+			debug_dst++;
+			*(dst++) = context->colors[pixel & 0x3F];
+		}
+	}
+}
+
+static void render_testreg_highlight(vdp_context *context, int32_t col, uint32_t *dst, uint8_t *debug_dst, int plane_a_off, int plane_b_off, uint8_t output_disabled, uint8_t test_layer)
+{
+	int start = 0;
+	uint8_t *sprite_buf = context->linebuf + col * 8;
+	if (!col && (context->regs[REG_MODE_1] & BIT_COL0_MASK)) {
+		//TODO: Confirm how test register interacts with column 0 blanking
+		uint8_t pixel = context->regs[REG_BG_COLOR] & 0x3F;
+		uint8_t src = DBG_SRC_BG | DBG_SHADOW;
+		for (int i = 0; i < 8; ++i)
+		{
+			switch (test_layer)
+			{
+			case 1:
+				pixel &= sprite_buf[i];
+				if (pixel) {
+					src = DBG_SRC_S | DBG_SHADOW;
+				}
+				break;
+			case 2:
+				pixel &= context->tmp_buf_a[(plane_a_off + i) & SCROLL_BUFFER_MASK];
+				if (pixel) {
+					src = DBG_SRC_A | DBG_SHADOW;
+				}
+				break;
+			case 3:
+				pixel &= context->tmp_buf_b[(plane_b_off + i) & SCROLL_BUFFER_MASK];
+				if (pixel) {
+					src = DBG_SRC_B | DBG_SHADOW;
+				}
+				break;
+			}
+			
+			*(dst++) = context->colors[SHADOW_OFFSET + (pixel & 0x3F)];
+			*(debug_dst++) = src;
+		}
+		plane_a_off += 8;
+		plane_b_off += 8;
+		sprite_buf += 8;
+		start = 8;
+	}
+	for (int i = start; i < 16; ++plane_a_off, ++plane_b_off, ++sprite_buf, ++i)
+	{
+		uint8_t sprite, plane_a, plane_b;
+		plane_a = context->tmp_buf_a[plane_a_off & SCROLL_BUFFER_MASK];
+		plane_b = context->tmp_buf_b[plane_b_off & SCROLL_BUFFER_MASK];
+		sprite = *sprite_buf;
+		sh_pixel pixel = composite_highlight(context, debug_dst, sprite, plane_a, plane_b, 0x3F);
+		uint32_t *colors;
+		if (pixel.intensity == BUF_BIT_PRIORITY << 1) {
+			colors = context->colors + HIGHLIGHT_OFFSET;
+		} else if (pixel.intensity) {
+			colors = context->colors;
+		} else {
+			colors = context->colors + SHADOW_OFFSET;
+		}
+		if (output_disabled) {
+			pixel.index = 0x3F;
+		}
+		switch (test_layer)
+		{
+		case 1:
+			pixel.index &= sprite;
+			if (pixel.index) {
+				*debug_dst = DBG_SRC_S;
+			}
+			break;
+		case 2:
+			pixel.index &= plane_a;
+			if (pixel.index) {
+				*debug_dst = DBG_SRC_A;
+			}
+			break;
+		case 3:
+			pixel.index &= plane_b;
+			if (pixel.index) {
+				*debug_dst = DBG_SRC_B;
+			}
+			break;
+		}
+		debug_dst++;
+		*(dst++) = colors[pixel.index & 0x3F];
+	}
+}
+
 static void render_map_output(uint32_t line, int32_t col, vdp_context * context)
 {
 	uint32_t *dst;
+	uint8_t *debug_dst;
 	uint8_t output_disabled = (context->test_port & TEST_BIT_DISABLE) != 0;
 	uint8_t test_layer = context->test_port >> 7 & 3;
 	if (context->state == PREPARING && !test_layer) {
@@ -1301,198 +1609,44 @@ static void render_map_output(uint32_t line, int32_t col, vdp_context * context)
 	}
 	line &= 0xFF;
 	render_map(context->col_2, context->tmp_buf_b, context->buf_b_off+8, context);
-	uint8_t *sprite_buf,  *plane_a, *plane_b;
+	uint8_t *sprite_buf;
+	uint8_t sprite, plane_a, plane_b;
 	int plane_a_off, plane_b_off;
 	if (col)
 	{
 		col-=2;
 		dst = context->output + BORDER_LEFT + col * 8;
-		if (context->debug < 2) {
-			sprite_buf = context->linebuf + col * 8;
-			uint8_t a_src, src;
-			if (context->flags & FLAG_WINDOW) {
-				plane_a_off = context->buf_a_off;
-				a_src = DBG_SRC_W;
-			} else {
-				plane_a_off = context->buf_a_off - (context->hscroll_a & 0xF);
-				a_src = DBG_SRC_A;
-			}
-			plane_b_off = context->buf_b_off - (context->hscroll_b & 0xF);
-			//printf("A | tmp_buf offset: %d\n", 8 - (context->hscroll_a & 0x7));
+		debug_dst = context->layer_debug_buf + BORDER_LEFT + col * 8;
+		
+		
+		uint8_t a_src, src;
+		if (context->flags & FLAG_WINDOW) {
+			plane_a_off = context->buf_a_off;
+			a_src = DBG_SRC_W;
+		} else {
+			plane_a_off = context->buf_a_off - (context->hscroll_a & 0xF);
+			a_src = DBG_SRC_A;
+		}
+		plane_b_off = context->buf_b_off - (context->hscroll_b & 0xF);
+		//printf("A | tmp_buf offset: %d\n", 8 - (context->hscroll_a & 0x7));
 
-			if (context->regs[REG_MODE_4] & BIT_HILIGHT) {
-				for (int i = 0; i < 16; ++plane_a_off, ++plane_b_off, ++sprite_buf, ++i) {
-					plane_a = context->tmp_buf_a + (plane_a_off & SCROLL_BUFFER_MASK);
-					plane_b = context->tmp_buf_b + (plane_b_off & SCROLL_BUFFER_MASK);
-					uint8_t pixel = context->regs[REG_BG_COLOR];
-					uint32_t *colors = context->colors;
-					src = DBG_SRC_BG;
-					if (*plane_b & 0xF) {
-						pixel = *plane_b;
-						src = DBG_SRC_B;
-					}
-					uint8_t intensity = *plane_b & BUF_BIT_PRIORITY;
-					if (*plane_a & 0xF && (*plane_a & BUF_BIT_PRIORITY) >= (pixel & BUF_BIT_PRIORITY)) {
-						pixel = *plane_a;
-						src = a_src;
-					}
-					intensity |= *plane_a & BUF_BIT_PRIORITY;
-					if (*sprite_buf & 0xF && (*sprite_buf & BUF_BIT_PRIORITY) >= (pixel & BUF_BIT_PRIORITY)) {
-						if ((*sprite_buf & 0x3F) == 0x3E) {
-							intensity += BUF_BIT_PRIORITY;
-						} else if ((*sprite_buf & 0x3F) == 0x3F) {
-							intensity = 0;
-						} else {
-							pixel = *sprite_buf;
-							src = DBG_SRC_S;
-							if ((pixel & 0xF) == 0xE) {
-								intensity = BUF_BIT_PRIORITY;
-							} else {
-								intensity |= pixel & BUF_BIT_PRIORITY;
-							}
-						}
-					}
-					if (output_disabled) {
-						pixel = 0x3F;
-					}
-					if (!intensity) {
-						src |= DBG_SHADOW;
-						colors += CRAM_SIZE;
-					} else if (intensity ==  BUF_BIT_PRIORITY*2) {
-						src |= DBG_HILIGHT;
-						colors += CRAM_SIZE*2;
-					}
-					//TODO: Verify how test register stuff interacts with shadow/highlight
-					//TODO: Simulate CRAM corruption from bus fight
-					switch (test_layer)
-					{
-					case 1:
-						pixel &= *sprite_buf;
-						if (output_disabled && pixel) {
-							src = DBG_SRC_S;
-						}
-						break;
-					case 2:
-						pixel &= *plane_a;
-						if (output_disabled && pixel) {
-							src = DBG_SRC_A;
-						}
-						break;
-					case 3:
-						pixel &= *plane_b;
-						if (output_disabled && pixel) {
-							src = DBG_SRC_B;
-						}
-						break;
-					}
-
-					uint32_t outpixel;
-					if (context->debug) {
-						outpixel = context->debugcolors[src];
-					} else {
-						outpixel = colors[pixel & 0x3F];
-					}
-					*(dst++) = outpixel;
-				}
+		if (context->regs[REG_MODE_4] & BIT_HILIGHT) {
+			if (output_disabled || test_layer) {
+				render_testreg_highlight(context, col, dst, debug_dst, plane_a_off, plane_b_off, output_disabled, test_layer);
 			} else {
-				for (int i = 0; i < 16; ++plane_a_off, ++plane_b_off, ++sprite_buf, ++i) {
-					plane_a = context->tmp_buf_a + (plane_a_off & SCROLL_BUFFER_MASK);
-					plane_b = context->tmp_buf_b + (plane_b_off & SCROLL_BUFFER_MASK);
-					uint8_t pixel = context->regs[REG_BG_COLOR];
-					src = DBG_SRC_BG;
-					if (output_disabled) {
-						pixel = 0x3F;
-					} else {
-						if (*plane_b & 0xF) {
-							pixel = *plane_b;
-							src = DBG_SRC_B;
-						}
-						if (*plane_a & 0xF && (*plane_a & BUF_BIT_PRIORITY) >= (pixel & BUF_BIT_PRIORITY)) {
-							pixel = *plane_a;
-							src = a_src;
-						}
-						if (*sprite_buf & 0xF && (*sprite_buf & BUF_BIT_PRIORITY) >= (pixel & BUF_BIT_PRIORITY)) {
-							pixel = *sprite_buf;
-							src = DBG_SRC_S;
-						}
-					}
-					//TODO: Simulate CRAM corruption from bus fight
-					switch (test_layer)
-					{
-					case 1:
-						pixel &= *sprite_buf;
-						if (output_disabled && pixel) {
-							src = DBG_SRC_S;
-						}
-						break;
-					case 2:
-						pixel &= *plane_a;
-						if (output_disabled && pixel) {
-							src = DBG_SRC_A;
-						}
-						break;
-					case 3:
-						pixel &= *plane_b;
-						if (output_disabled && pixel) {
-							src = DBG_SRC_B;
-						}
-						break;
-					}
-					uint32_t outpixel;
-					if (context->debug) {
-						outpixel = context->debugcolors[src];
-					} else {
-						outpixel = context->colors[pixel & 0x3F];
-					}
-					*(dst++) = outpixel;
-				}
-			}
-		} else if (context->debug == 2) {
-			if (col < 32) {
-				*(dst++) = context->colors[col * 2];
-				*(dst++) = context->colors[col * 2];
-				*(dst++) = context->colors[col * 2];
-				*(dst++) = context->colors[col * 2];
-				*(dst++) = context->colors[col * 2 + 1];
-				*(dst++) = context->colors[col * 2 + 1];
-				*(dst++) = context->colors[col * 2 + 1];
-				*(dst++) = context->colors[col * 2 + 1];
-				*(dst++) = context->colors[col * 2 + 2];
-				*(dst++) = context->colors[col * 2 + 2];
-				*(dst++) = context->colors[col * 2 + 2];
-				*(dst++) = context->colors[col * 2 + 2];
-				*(dst++) = context->colors[col * 2 + 3];
-				*(dst++) = context->colors[col * 2 + 3];
-				*(dst++) = context->colors[col * 2 + 3];
-				*(dst++) = context->colors[col * 2 + 3];
-			} else if (col == 32 || line >= 192) {
-				for (int32_t i = 0; i < 16; i ++) {
-					*(dst++) = 0;
-				}
-			} else {
-				for (int32_t i = 0; i < 16; i ++) {
-					*(dst++) = context->colors[line / 3 + (col - 34) * 0x20];
-				}
+				render_highlight(context, col, dst, debug_dst, plane_a_off, plane_b_off);
 			}
 		} else {
-			uint32_t base = (context->debug - 3) * 0x200;
-			uint32_t cell = base + (line / 8) * (context->regs[REG_MODE_4] & BIT_H40 ? 40 : 32) + col;
-			uint32_t address = (cell * 32 + (line % 8) * 4) & 0xFFFF;
-			for (int32_t i = 0; i < 4; i ++) {
-				*(dst++) = context->colors[(context->debug_pal << 4) | (context->vdpmem[address] >> 4)];
-				*(dst++) = context->colors[(context->debug_pal << 4) | (context->vdpmem[address] & 0xF)];
-				address++;
-			}
-			cell++;
-			address = (cell * 32 + (line % 8) * 4) & 0xFFFF;
-			for (int32_t i = 0; i < 4; i ++) {
-				*(dst++) = context->colors[(context->debug_pal << 4) | (context->vdpmem[address] >> 4)];
-				*(dst++) = context->colors[(context->debug_pal << 4) | (context->vdpmem[address] & 0xF)];
-				address++;
+			if (output_disabled || test_layer) {
+				render_testreg(context, col, dst, debug_dst, plane_a_off, plane_b_off, output_disabled, test_layer);
+			} else {
+				render_normal(context, col, dst, debug_dst, plane_a_off, plane_b_off);
 			}
 		}
+		dst += 16;
 	} else {
 		dst = context->output;
+		debug_dst = context->layer_debug_buf;
 		uint8_t pixel = context->regs[REG_BG_COLOR] & 0x3F;
 		if (output_disabled) {
 			pixel = 0x3F;
@@ -1503,9 +1657,11 @@ static void render_map_output(uint32_t line, int32_t col, vdp_context * context)
 			{
 			case 1:
 				bg_color = context->colors[0];
-				for (int i = 0; i < BORDER_LEFT; i++, dst++)
+				for (int i = 0; i < BORDER_LEFT; i++, dst++, debug_dst++)
 				{
 					*dst = bg_color;
+					*debug_dst = DBG_SRC_BG;
+					
 				}
 				break;
 			case 2: {
@@ -1515,9 +1671,10 @@ static void render_map_output(uint32_t line, int32_t col, vdp_context * context)
 				i = 0;
 				uint8_t buf_off = context->buf_a_off - (context->hscroll_a & 0xF) + (16 - BORDER_LEFT);
 				//uint8_t *src = context->tmp_buf_a + ((context->buf_a_off + (i ? 0 : (16 - BORDER_LEFT) - (context->hscroll_a & 0xF))) & SCROLL_BUFFER_MASK); 
-				for (; i < BORDER_LEFT; buf_off++, i++, dst++)
+				for (; i < BORDER_LEFT; buf_off++, i++, dst++, debug_dst++)
 				{
 					*dst = context->colors[context->tmp_buf_a[buf_off & SCROLL_BUFFER_MASK]];
+					*debug_dst = DBG_SRC_A;
 				}
 				break;
 			}
@@ -1527,17 +1684,19 @@ static void render_map_output(uint32_t line, int32_t col, vdp_context * context)
 				i = 0;
 				uint8_t buf_off = context->buf_b_off - (context->hscroll_b & 0xF) + (16 - BORDER_LEFT);
 				//uint8_t *src = context->tmp_buf_b + ((context->buf_b_off + (i ? 0 : (16 - BORDER_LEFT) - (context->hscroll_b & 0xF))) & SCROLL_BUFFER_MASK); 
-				for (; i < BORDER_LEFT; buf_off++, i++, dst++)
+				for (; i < BORDER_LEFT; buf_off++, i++, dst++, debug_dst++)
 				{
 					*dst = context->colors[context->tmp_buf_b[buf_off & SCROLL_BUFFER_MASK]];
+					*debug_dst = DBG_SRC_B;
 				}
 				break;
 			}
 			}
 		} else {
-			for (int i = 0; i < BORDER_LEFT; i++, dst++)
+			for (int i = 0; i < BORDER_LEFT; i++, dst++, debug_dst++)
 			{
 				*dst = bg_color;
+				*debug_dst = DBG_SRC_BG;
 			}
 		}
 	}
@@ -1586,8 +1745,9 @@ static void render_map_mode4(uint32_t line, int32_t col, vdp_context * context)
 	}
 	context->buf_a_off = (context->buf_a_off + 8) & 15;
 	
-	uint8_t bgcolor = 0x10 | (context->regs[REG_BG_COLOR] & 0xF) + CRAM_SIZE*3;
+	uint8_t bgcolor = 0x10 | (context->regs[REG_BG_COLOR] & 0xF) + MODE4_OFFSET;
 	uint32_t *dst = context->output + col * 8 + BORDER_LEFT;
+	uint8_t *debug_dst = context->layer_debug_buf + col * 8 + BORDER_LEFT;
 	if (context->state == PREPARING) {
 		for (int i = 0; i < 16; i++)
 		{
@@ -1596,65 +1756,30 @@ static void render_map_mode4(uint32_t line, int32_t col, vdp_context * context)
 		context->done_output = dst;
 		return;
 	}
-	if (context->debug < 2) {
-		if (col || !(context->regs[REG_MODE_1] & BIT_COL0_MASK)) {
-			uint8_t *sprite_src = context->linebuf + col * 8;
-			if (context->regs[REG_MODE_1] & BIT_SPRITE_8PX) {
-				sprite_src += 8;
-			}
-			for (int i = 0; i < 8; i++, sprite_src++)
-			{
-				uint8_t *bg_src = context->tmp_buf_a + ((8 + i + col * 8 - (context->hscroll_a & 0x7)) & 15);
-				if ((*bg_src & 0x4F) > 0x40 || !*sprite_src) {
-					//background plane has priority and is opaque or sprite layer is transparent
-					if (context->debug) {
-						*(dst++) = context->debugcolors[DBG_SRC_A];
-					} else {
-						*(dst++) = context->colors[(*bg_src & 0x1F) + CRAM_SIZE*3];
-					}
-				} else {
-					//sprite layer is opaque and not covered by high priority BG pixels
-					if (context->debug) {
-						*(dst++) = context->debugcolors[DBG_SRC_S];
-					} else {
-						*(dst++) = context->colors[*sprite_src | 0x10 + CRAM_SIZE*3];
-					}
-				}
-			}
-		} else {
-			for (int i = 0; i < 8; i++)
-			{
-				*(dst++) = context->colors[bgcolor];
-			}
+	
+	if (col || !(context->regs[REG_MODE_1] & BIT_COL0_MASK)) {
+		uint8_t *sprite_src = context->linebuf + col * 8;
+		if (context->regs[REG_MODE_1] & BIT_SPRITE_8PX) {
+			sprite_src += 8;
 		}
-	} else if (context->debug == 2) {
-		for (int i = 0; i < 8; i++)
+		for (int i = 0; i < 8; i++, sprite_src++)
 		{
-			*(dst++) = context->colors[CRAM_SIZE*3 + col];
+			uint8_t *bg_src = context->tmp_buf_a + ((8 + i + col * 8 - (context->hscroll_a & 0x7)) & 15);
+			if ((*bg_src & 0x4F) > 0x40 || !*sprite_src) {
+				//background plane has priority and is opaque or sprite layer is transparent
+				*(dst++) = context->colors[(*bg_src & 0x1F) + MODE4_OFFSET];
+				*(debug_dst++) = DBG_SRC_A;
+			} else {
+				//sprite layer is opaque and not covered by high priority BG pixels
+				*(dst++) = context->colors[*sprite_src | 0x10 + MODE4_OFFSET];
+				*(debug_dst++) = DBG_SRC_S;
+			}
 		}
 	} else {
-		uint32_t cell = (line / 8) * 32 + col;
-		uint32_t address = cell * 32 + (line % 8) * 4;
-		uint32_t m4_address = mode4_address_map[address & 0x3FFF];
-		uint32_t pixel = planar_to_chunky[context->vdpmem[m4_address]] << 1;
-		pixel |= planar_to_chunky[context->vdpmem[m4_address + 1]];
-		m4_address = mode4_address_map[(address + 2) & 0x3FFF];
-		pixel |= planar_to_chunky[context->vdpmem[m4_address]] << 3;
-		pixel |= planar_to_chunky[context->vdpmem[m4_address + 1]] << 2;
-		if (context->debug_pal < 2) {
-			for (int i = 28; i >= 0; i -= 4)
-			{
-				*(dst++) = context->colors[CRAM_SIZE*3 | (context->debug_pal << 4) | (pixel >> i & 0xF)];
-			}
-		} else {
-			for (int i = 28; i >= 0; i -= 4)
-			{
-				uint8_t value = (pixel >> i & 0xF) * 17;
-				if (context->debug_pal == 3) {
-					value = 255 - value;
-				}
-				*(dst++) = render_map_color(value, value, value);
-			}
+		for (int i = 0; i < 8; i++)
+		{
+			*(dst++) = context->colors[bgcolor];
+			*(debug_dst++) = DBG_SRC_BG;
 		}
 	}
 	context->done_output = dst;
@@ -1674,31 +1799,69 @@ static void vdp_advance_line(vdp_context *context)
 	}
 	last_line = context->cycles;
 #endif
-	context->vcounter++;
-	
+	uint16_t jump_start, jump_end;
 	uint8_t is_mode_5 = context->regs[REG_MODE_2] & BIT_MODE_5;
 	if (is_mode_5) {
 		if (context->flags2 & FLAG2_REGION_PAL) {
 			if (context->regs[REG_MODE_2] & BIT_PAL) {
-				if (context->vcounter == 0x10B) {
-					context->vcounter = 0x1D2;
-				}
-			} else if (context->vcounter == 0x103){
-				context->vcounter = 0x1CA;
+				jump_start = 0x10B;
+				jump_end = 0x1D2;
+			} else {
+				jump_start = 0x103;
+				jump_end = 0x1CA;
 			}
+		} else if (context->regs[REG_MODE_2] & BIT_PAL) {
+			jump_start = 0x100;
+			jump_end = 0x1FA;
 		} else {
-			if (context->regs[REG_MODE_2] & BIT_PAL) {
-				if (context->vcounter == 0x100) {
-					context->vcounter = 0x1FA;
+			jump_start = 0xEB;
+			jump_end = 0x1E5;
+		}
+	} else {
+		jump_start = 0xDB;
+		jump_end = 0x1D5;
+	}
+
+	if (context->enabled_debuggers & (1 << VDP_DEBUG_CRAM | 1 << VDP_DEBUG_COMPOSITE)) {
+		uint32_t line = context->vcounter;
+		if (line >= jump_end) {
+			line -= jump_end - jump_start;
+		}
+		uint32_t total_lines = (context->flags2 & FLAG2_REGION_PAL) ? 313 : 262;
+		
+		if (total_lines - line <= context->border_top) {
+			line -= total_lines - context->border_top;
+		} else {
+			line += context->border_top;
+		}
+		if (context->enabled_debuggers & (1 << VDP_DEBUG_CRAM)) {
+			uint32_t *fb = context->debug_fbs[VDP_DEBUG_CRAM] + context->debug_fb_pitch[VDP_DEBUG_CRAM] * line / sizeof(uint32_t);
+			for (int i = 0; i < 64; i++)
+			{
+				for (int x = 0; x < 8; x++)
+				{
+					*(fb++) = context->colors[i];
 				}
-			} else if (context->vcounter == 0xEB) {
-				context->vcounter = 0x1E5;
 			}
 		}
-	} else if (context->vcounter == 0xDB) {
-		context->vcounter = 0x1D5;
+		if (
+			context->enabled_debuggers & (1 << VDP_DEBUG_COMPOSITE)
+			&& line < (context->inactive_start + context->border_bot + context->border_top)
+		) {
+			uint32_t *fb = context->debug_fbs[VDP_DEBUG_COMPOSITE] + context->debug_fb_pitch[VDP_DEBUG_COMPOSITE] * line / sizeof(uint32_t);
+			for (int i = 0; i < LINEBUF_SIZE; i++)
+			{
+				*(fb++) = context->debugcolors[context->layer_debug_buf[i]];
+			}
+		}
 	}
-	context->vcounter &= 0x1FF;
+	
+	context->vcounter++;
+	if (context->vcounter == jump_start) {
+		context->vcounter = jump_end;
+	} else {
+		context->vcounter &= 0x1FF;
+	}
 	if (context->state == PREPARING) {
 		context->state = ACTIVE;
 	}
@@ -1717,6 +1880,190 @@ static void vdp_advance_line(vdp_context *context)
 	}
 }
 
+static void vdp_update_per_frame_debug(vdp_context *context)
+{
+	if (context->enabled_debuggers & (1 << VDP_DEBUG_PLANE)) {
+		uint32_t pitch;
+		uint32_t *fb = render_get_framebuffer(context->debug_fb_indices[VDP_DEBUG_PLANE], &pitch);
+		uint16_t hscroll_mask;
+		uint16_t v_mul;
+		uint16_t vscroll_mask = 0x1F | (context->regs[REG_SCROLL] & 0x30) << 1;
+		switch(context->regs[REG_SCROLL] & 0x3)
+		{
+		case 0:
+			hscroll_mask = 0x1F;
+			v_mul = 64;
+			break;
+		case 0x1:
+			hscroll_mask = 0x3F;
+			v_mul = 128;
+			break;
+		case 0x2:
+			//TODO: Verify this behavior
+			hscroll_mask = 0x1F;
+			v_mul = 0;
+			break;
+		case 0x3:
+			hscroll_mask = 0x7F;
+			v_mul = 256;
+			break;
+		}
+		uint16_t table_address;
+		switch(context->debug_modes[VDP_DEBUG_PLANE] % 3)
+		{
+		case 0:
+			table_address = context->regs[REG_SCROLL_A] << 10 & 0xE000;
+			break;
+		case 1:
+			table_address = context->regs[REG_SCROLL_B] << 13 & 0xE000;
+			break;
+		case 2:
+			table_address = context->regs[REG_WINDOW] << 10;
+			if (context->regs[REG_MODE_4] & BIT_H40) {
+				table_address &= 0xF000;
+				v_mul = 128;
+				hscroll_mask = 0x3F;
+			} else {
+				table_address &= 0xF800;
+				v_mul = 64;
+				hscroll_mask = 0x1F;
+			}
+			vscroll_mask = 0x1F;
+			break;
+		}
+		uint32_t bg_color = context->colors[context->regs[REG_BG_COLOR & 0x3F]];
+		for (uint16_t row = 0; row < 128; row++)
+		{
+			uint16_t row_address = table_address + (row & vscroll_mask) * v_mul;
+			for (uint16_t col = 0; col < 128; col++)
+			{
+				uint16_t address = row_address + (col & hscroll_mask) * 2;
+				//pccv hnnn nnnn nnnn
+				//
+				uint16_t entry = context->vdpmem[address] << 8 | context->vdpmem[address + 1];
+				uint8_t pal = entry >> 9 & 0x30;
+				
+				uint32_t *dst = fb + (row * pitch * 8 / sizeof(uint32_t)) + col * 8;
+				address = (entry & 0x7FF) * 32;
+				int y_diff = 4;
+				if (entry & 0x1000) {
+					y_diff = -4;
+					address += 7 * 4;
+				}
+				int x_diff = 1;
+				if (entry & 0x800) {
+					x_diff = -1;
+					address += 3;
+				}
+				for (int y = 0; y < 8; y++)
+				{
+					uint16_t trow_address = address;
+					uint32_t *row_dst = dst;
+					for (int x = 0; x < 4; x++)
+					{
+						uint8_t byte = context->vdpmem[trow_address];
+						trow_address += x_diff;
+						uint8_t left, right;
+						if (x_diff > 0) {
+							left = byte >> 4;
+							right = byte & 0xF;
+						} else {
+							left = byte & 0xF;
+							right = byte >> 4;
+						}
+						*(row_dst++) = left ? context->colors[left|pal] : bg_color;
+						*(row_dst++) = right ? context->colors[right|pal] : bg_color;
+					}
+					address += y_diff;
+					dst += pitch / sizeof(uint32_t);
+				}
+			}
+		}
+		render_framebuffer_updated(context->debug_fb_indices[VDP_DEBUG_PLANE], 1024);
+	}
+	
+	if (context->enabled_debuggers & (1 << VDP_DEBUG_VRAM)) {
+		uint32_t pitch;
+		uint32_t *fb = render_get_framebuffer(context->debug_fb_indices[VDP_DEBUG_VRAM], &pitch);
+		
+		uint8_t pal = (context->debug_modes[VDP_DEBUG_VRAM] % 4) << 4;
+		for (int y = 0; y < 512; y++)
+		{
+			uint32_t *line = fb + y * pitch / sizeof(uint32_t);
+			int row = y >> 4;
+			int yoff = y >> 1 & 7;
+			for (int col = 0; col < 64; col++)
+			{
+				uint16_t address = (row * 64 + col) * 32 + yoff * 4;
+				for (int x = 0; x < 4; x++)
+				{
+					uint8_t byte = context->vdpmem[address++];
+					uint8_t left = byte >> 4 | pal;
+					uint8_t right = byte & 0xF | pal;
+					*(line++) = context->colors[left];
+					*(line++) = context->colors[left];
+					*(line++) = context->colors[right];
+					*(line++) = context->colors[right];
+				}
+			}
+		}
+		
+		render_framebuffer_updated(context->debug_fb_indices[VDP_DEBUG_VRAM], 1024);
+	}
+	
+	if (context->enabled_debuggers & (1 << VDP_DEBUG_CRAM)) {
+		uint32_t starting_line = 512 - 32*4;
+		uint32_t *line = context->debug_fbs[VDP_DEBUG_CRAM] 
+			+ context->debug_fb_pitch[VDP_DEBUG_CRAM]  * starting_line / sizeof(uint32_t);
+		for (int pal = 0; pal < 4; pal ++)
+		{
+			uint32_t *cur;
+			for (int y = 0; y < 31; y++)
+			{
+				cur = line;
+				for (int offset = 0; offset < 16; offset++)
+				{
+					for (int x = 0; x < 31; x++)
+					{
+						*(cur++) = context->colors[pal * 16 + offset];
+					}
+					*(cur++) = 0xFF000000;
+				}
+				line += context->debug_fb_pitch[VDP_DEBUG_CRAM] / sizeof(uint32_t);
+			}
+			cur = line;
+			for (int x = 0; x < 512; x++)
+			{
+				*(cur++) = 0xFF000000;
+			}
+			line += context->debug_fb_pitch[VDP_DEBUG_CRAM] / sizeof(uint32_t);
+		}
+		render_framebuffer_updated(context->debug_fb_indices[VDP_DEBUG_CRAM], 512);
+		context->debug_fbs[VDP_DEBUG_CRAM] = render_get_framebuffer(context->debug_fb_indices[VDP_DEBUG_CRAM], &context->debug_fb_pitch[VDP_DEBUG_CRAM]);
+	}
+	if (context->enabled_debuggers & (1 << VDP_DEBUG_COMPOSITE)) {
+		render_framebuffer_updated(context->debug_fb_indices[VDP_DEBUG_COMPOSITE], LINEBUF_SIZE);
+		context->debug_fbs[VDP_DEBUG_COMPOSITE] = render_get_framebuffer(context->debug_fb_indices[VDP_DEBUG_COMPOSITE], &context->debug_fb_pitch[VDP_DEBUG_COMPOSITE]);
+	}		
+}
+
+void vdp_force_update_framebuffer(vdp_context *context)
+{
+	uint16_t lines_max = (context->flags2 & FLAG2_REGION_PAL) 
+			? 240 + BORDER_TOP_V30_PAL + BORDER_BOT_V30_PAL 
+			: 224 + BORDER_TOP_V28 + BORDER_BOT_V28;
+			
+	uint16_t to_fill = lines_max - context->output_lines;
+	memset(
+		((char *)context->fb) + context->output_pitch * context->output_lines,
+		0,
+		to_fill * context->output_pitch
+	);
+	render_framebuffer_updated(context->cur_buffer, context->h40_lines > context->output_lines / 2 ? LINEBUF_SIZE : (256+HORIZ_BORDER));
+	context->fb = render_get_framebuffer(context->cur_buffer, &context->output_pitch);
+	vdp_update_per_frame_debug(context);
+}
+
 static void advance_output_line(vdp_context *context)
 {
 	if (headless) {
@@ -1733,6 +2080,7 @@ static void advance_output_line(vdp_context *context)
 			render_framebuffer_updated(context->cur_buffer, context->h40_lines > (context->inactive_start + context->border_top) / 2 ? LINEBUF_SIZE : (256+HORIZ_BORDER));
 			context->cur_buffer = context->flags2 & FLAG2_EVEN_FIELD ? FRAMEBUFFER_EVEN : FRAMEBUFFER_ODD;
 			context->fb = render_get_framebuffer(context->cur_buffer, &context->output_pitch);
+			vdp_update_per_frame_debug(context);
 			context->h40_lines = 0;
 			context->frame++;
 			context->output_lines = 0;
@@ -2042,7 +2390,7 @@ static void draw_right_border(vdp_context *context)
 	case CALC_SLOT(slot, 3):\
 		if ((slot + 3) == 140) {\
 			uint32_t *dst = context->output + BORDER_LEFT + 256 + 8;\
-			uint32_t bgcolor = context->colors[0x10 | (context->regs[REG_BG_COLOR] & 0xF) + CRAM_SIZE*3];\
+			uint32_t bgcolor = context->colors[0x10 | (context->regs[REG_BG_COLOR] & 0xF) + MODE4_OFFSET];\
 			for (int i = 0; i < BORDER_RIGHT-8; i++, dst++)\
 			{\
 				*dst = bgcolor;\
@@ -2562,7 +2910,7 @@ static void vdp_h32_mode4(vdp_context * context, uint32_t target_cycles)
 	case 0: {
 		scan_sprite_table_mode4(context);
 		uint32_t *dst = context->output;;
-		uint32_t bgcolor = context->colors[0x10 | (context->regs[REG_BG_COLOR] & 0xF) + CRAM_SIZE*3];
+		uint32_t bgcolor = context->colors[0x10 | (context->regs[REG_BG_COLOR] & 0xF) + MODE4_OFFSET];
 		for (int i = 0; i < BORDER_LEFT-8; i++, dst++)
 		{
 			*dst = bgcolor;
@@ -2584,7 +2932,7 @@ static void vdp_h32_mode4(vdp_context * context, uint32_t target_cycles)
 		context->buf_a_off = 8;
 		memset(context->tmp_buf_a, 0, 8);
 		uint32_t *dst = context->output + BORDER_LEFT - 8;
-		uint32_t bgcolor = context->colors[0x10 | (context->regs[REG_BG_COLOR] & 0xF) + CRAM_SIZE*3];
+		uint32_t bgcolor = context->colors[0x10 | (context->regs[REG_BG_COLOR] & 0xF) + MODE4_OFFSET];
 		for (int i = 0; i < 8; i++, dst++)
 		{
 			*dst = bgcolor;
@@ -2640,7 +2988,7 @@ static void vdp_h32_mode4(vdp_context * context, uint32_t target_cycles)
 		context->cur_slot = context->sprite_index = MAX_DRAWS_H32_MODE4-1;
 		context->sprite_draws = MAX_DRAWS_H32_MODE4;
 		uint32_t *dst = context->output + BORDER_LEFT + 256;
-		uint32_t bgcolor = context->colors[0x10 | (context->regs[REG_BG_COLOR] & 0xF) + CRAM_SIZE*3];
+		uint32_t bgcolor = context->colors[0x10 | (context->regs[REG_BG_COLOR] & 0xF) + MODE4_OFFSET];
 		for (int i = 0; i < 8; i++, dst++)
 		{
 			*dst = bgcolor;
@@ -2763,18 +3111,26 @@ static void vdp_inactive(vdp_context *context, uint32_t target_cycles, uint8_t i
 			active_line = 0x200;
 		}
 	}
-	uint32_t *dst = (
-		context->vcounter < context->inactive_start + context->border_bot 
-		|| context->vcounter >= 0x200 - context->border_top
-	) && context->hslot >= BG_START_SLOT && context->hslot < bg_end_slot
-		? context->output + 2 * (context->hslot - BG_START_SLOT)
-		: NULL;
+	uint32_t *dst;
+	uint8_t *debug_dst;
+	if (
+		(
+			context->vcounter < context->inactive_start + context->border_bot 
+			|| context->vcounter >= 0x200 - context->border_top
+		) && context->hslot >= BG_START_SLOT && context->hslot < bg_end_slot
+	) {
+		dst = context->output + 2 * (context->hslot - BG_START_SLOT);
+		debug_dst = context->layer_debug_buf + 2 * (context->hslot - BG_START_SLOT);
+	} else {
+		dst = NULL;
+	}
 		
 	if (
 		!dst && context->vcounter == context->inactive_start + context->border_bot
 		&& context->hslot >= line_change  && context->hslot < bg_end_slot
 	) {
 		dst = context->output + 2 * (context->hslot - BG_START_SLOT);
+		debug_dst = context->layer_debug_buf + 2 * (context->hslot - BG_START_SLOT);
 	}
 		
 	uint8_t test_layer = context->test_port >> 7 & 3;
@@ -2790,6 +3146,7 @@ static void vdp_inactive(vdp_context *context, uint32_t target_cycles, uint8_t i
 			|| context->vcounter >= 0x200 - context->border_top
 		)) {
 			dst = context->output + (context->hslot - BG_START_SLOT) * 2;
+			debug_dst = context->layer_debug_buf + 2 * (context->hslot - BG_START_SLOT);
 		} else if (context->hslot == bg_end_slot) {
 			advance_output_line(context);
 			dst = NULL;
@@ -2846,21 +3203,26 @@ static void vdp_inactive(vdp_context *context, uint32_t target_cycles, uint8_t i
 			if (mode_5) {
 				bg_color = context->colors[context->regs[REG_BG_COLOR] & 0x3F];
 			} else if (context->regs[REG_MODE_1] & BIT_MODE_4) {
-				bg_color = context->colors[CRAM_SIZE * 3 + 0x10 + (context->regs[REG_BG_COLOR] & 0xF)];
+				bg_color = context->colors[MODE4_OFFSET + 0x10 + (context->regs[REG_BG_COLOR] & 0xF)];
 			}
 			if (dst >= context->done_output) {
 				*(dst++) = bg_color;
+				*(debug_dst++) = DBG_SRC_BG;
 			} else {
 				dst++;
+				debug_dst++;
 			}
 			if (dst >= context->done_output) {
 				*(dst++) = bg_color;
+				*(debug_dst++) = DBG_SRC_BG;
 				context->done_output = dst;
 			} else {
 				dst++;
+				debug_dst++;
 			}
 			if (context->hslot == (bg_end_slot-1)) {
 				*(dst++) = bg_color;
+				*(debug_dst++) = DBG_SRC_BG;
 				context->done_output = dst;
 			}
 		}
@@ -2949,7 +3311,7 @@ void vdp_run_dma_done(vdp_context * context, uint32_t target_cycles)
 		}
 		uint32_t min_dma_complete = dmalen * (context->regs[REG_MODE_4] & BIT_H40 ? 16 : 20);
 		if (
-			(context->regs[REG_DMASRC_H] & 0xC0) == 0xC0 
+			(context->regs[REG_DMASRC_H] & DMA_TYPE_MASK) == DMA_COPY 
 			|| (((context->cd & 0xF) == VRAM_WRITE) && !(context->regs[REG_MODE_2] & BIT_128K_VRAM))) {
 			//DMA copies take twice as long to complete since they require a read and a write
 			//DMA Fills and transfers to VRAM also take twice as long as it requires 2 writes for a single word
@@ -3025,7 +3387,7 @@ int vdp_control_port_write(vdp_context * context, uint16_t value)
 		//printf("New Address: %X, New CD: %X\n", context->address, context->cd);
 		if (context->cd & 0x20) {
 			//
-			if((context->regs[REG_DMASRC_H] & 0xC0) != 0x80) {
+			if((context->regs[REG_DMASRC_H] & DMA_TYPE_MASK) != DMA_FILL) {
 				//DMA copy or 68K -> VDP, transfer starts immediately
 				//printf("DMA start (length: %X) at cycle %d, frame: %d, vcounter: %d, hslot: %d\n", (context->regs[REG_DMALEN_H] << 8) | context->regs[REG_DMALEN_L], context->cycles, context->frame, context->vcounter, context->hslot);
 				if (!(context->regs[REG_DMASRC_H] & 0x80)) {
@@ -3106,7 +3468,7 @@ void vdp_control_port_write_pbc(vdp_context *context, uint8_t value)
 int vdp_data_port_write(vdp_context * context, uint16_t value)
 {
 	//printf("data port write: %X at %d\n", value, context->cycles);
-	if (context->flags & FLAG_DMA_RUN && (context->regs[REG_DMASRC_H] & 0xC0) != 0x80) {
+	if (context->flags & FLAG_DMA_RUN && (context->regs[REG_DMASRC_H] & DMA_TYPE_MASK) != DMA_FILL) {
 		return -1;
 	}
 	if (context->flags & FLAG_PENDING) {
@@ -3118,7 +3480,7 @@ int vdp_data_port_write(vdp_context * context, uint16_t value)
 	/*if (context->fifo_cur == context->fifo_end) {
 		printf("FIFO full, waiting for space before next write at cycle %X\n", context->cycles);
 	}*/
-	if (context->cd & 0x20 && (context->regs[REG_DMASRC_H] & 0xC0) == 0x80) {
+	if (context->cd & 0x20 && (context->regs[REG_DMASRC_H] & DMA_TYPE_MASK) == DMA_FILL) {
 		context->flags &= ~FLAG_DMA_RUN;
 	}
 	while (context->fifo_write == context->fifo_read) {
@@ -3154,7 +3516,7 @@ void vdp_data_port_write_pbc(vdp_context * context, uint8_t value)
 	/*if (context->fifo_cur == context->fifo_end) {
 		printf("FIFO full, waiting for space before next write at cycle %X\n", context->cycles);
 	}*/
-	if (context->cd & 0x20 && (context->regs[REG_DMASRC_H] & 0xC0) == 0x80) {
+	if (context->cd & 0x20 && (context->regs[REG_DMASRC_H] & DMA_TYPE_MASK) == DMA_FILL) {
 		context->flags &= ~FLAG_DMA_RUN;
 	}
 	while (context->fifo_write == context->fifo_read) {
@@ -3720,4 +4082,78 @@ void vdp_deserialize(deserialize_buffer *buf, void *vcontext)
 	context->pending_vint_start = load_int32(buf);
 	context->pending_hint_start = load_int32(buf);
 	update_video_params(context);
+}
+
+static vdp_context *current_vdp;
+static void vdp_debug_window_close(uint8_t which)
+{
+	//TODO: remove need for current_vdp global, and find the VDP via current_system instead
+	for (int i = 0; i < VDP_NUM_DEBUG_TYPES; i++)
+	{
+		if (current_vdp->enabled_debuggers & (1 << i) && which == current_vdp->debug_fb_indices[i]) {
+			vdp_toggle_debug_view(current_vdp, i);
+			break;
+		}
+	}
+}
+
+void vdp_toggle_debug_view(vdp_context *context, uint8_t debug_type)
+{
+	if (context->enabled_debuggers & 1 << debug_type) {
+		render_destroy_window(context->debug_fb_indices[debug_type]);
+		context->enabled_debuggers &= ~(1 << debug_type);
+	} else {
+		uint32_t width,height;
+		uint8_t fetch_immediately = 0;
+		char *caption;
+		switch(debug_type)
+		{
+		case VDP_DEBUG_PLANE:
+			caption = "BlastEm - VDP Plane Debugger";
+			width = height = 1024;
+			break;
+		case VDP_DEBUG_VRAM:
+			caption = "BlastEm - VDP VRAM Debugger";
+			width = 1024;
+			height = 512;
+			break;
+		case VDP_DEBUG_CRAM:
+			caption = "BlastEm - VDP CRAM Debugger";
+			width = 512;
+			height = 512;
+			fetch_immediately = 1;
+			break;
+		case VDP_DEBUG_COMPOSITE:
+			caption = "BlastEm - VDP Plane Composition Debugger";
+			width = LINEBUF_SIZE;
+			height = context->inactive_start + context->border_top + context->border_bot;
+			fetch_immediately = 1;
+			break;
+		default:
+			return;
+		}
+		current_vdp = context;
+		context->debug_fb_indices[debug_type] = render_create_window(caption, width, height, vdp_debug_window_close);
+		if (context->debug_fb_indices[debug_type]) {
+			context->enabled_debuggers |= 1 << debug_type;
+		}
+		if (fetch_immediately) {
+			context->debug_fbs[debug_type] = render_get_framebuffer(context->debug_fb_indices[debug_type], &context->debug_fb_pitch[debug_type]);
+		}
+	}
+}
+
+void vdp_inc_debug_mode(vdp_context *context)
+{
+	uint8_t active = render_get_active_framebuffer();
+	if (active < FRAMEBUFFER_USER_START) {
+		return;
+	}
+	for (int i = 0; i < VDP_NUM_DEBUG_TYPES; i++)
+	{
+		if (context->enabled_debuggers & (1 << i) && context->debug_fb_indices[i] == active) {
+			context->debug_modes[i]++;
+			return;
+		}
+	}
 }
