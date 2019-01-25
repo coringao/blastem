@@ -26,6 +26,7 @@
 #define MIN_POLL_INTERVAL 6840
 
 const char * device_type_names[] = {
+	"None",
 	"SMS gamepad",
 	"3-button gamepad",
 	"6-button gamepad",
@@ -38,8 +39,7 @@ const char * device_type_names[] = {
 	"EA 4-way Play cable A",
 	"EA 4-way Play cable B",
 	"Sega Parallel Transfer Board",
-	"Generic Device",
-	"None"
+	"Generic Device"
 };
 
 #define GAMEPAD_TH0 0
@@ -301,9 +301,9 @@ void setup_io_devices(tern_node * config, rom_info *rom, sega_io *io)
 {
 	io_port * ports = io->ports;
 	tern_node *io_nodes = tern_find_path(config, "io\0devices\0", TVAL_NODE).ptrval;
-	char * io_1 = rom->port1_override ? rom->port1_override : io_nodes ? tern_find_ptr(io_nodes, "1") : NULL;
-	char * io_2 = rom->port2_override ? rom->port2_override : io_nodes ? tern_find_ptr(io_nodes, "2") : NULL;
-	char * io_ext = rom->ext_override ? rom->ext_override : io_nodes ? tern_find_ptr(io_nodes, "ext") : NULL;
+	char * io_1 = rom->port1_override ? rom->port1_override : tern_find_ptr_default(io_nodes, "1", "gamepad6.1");
+	char * io_2 = rom->port2_override ? rom->port2_override : tern_find_ptr_default(io_nodes, "2", "gamepad6.2");
+	char * io_ext = rom->ext_override ? rom->ext_override : tern_find_ptr(io_nodes, "ext");
 
 	process_device(io_1, ports);
 	process_device(io_2, ports+1);

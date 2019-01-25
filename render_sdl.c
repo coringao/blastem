@@ -13,13 +13,18 @@
 #include "genesis.h"
 #include "bindings.h"
 #include "util.h"
+#include "paths.h"
 #include "ppm.h"
 #include "png.h"
 #include "config.h"
 #include "controller_info.h"
 
 #ifndef DISABLE_OPENGL
+#ifdef USE_GLES
+#include <SDL_opengles2.h>
+#else
 #include <GL/glew.h>
+#endif
 #endif
 
 #define MAX_EVENT_POLL_PER_FRAME 2
@@ -29,6 +34,7 @@ static SDL_Window **extra_windows;
 static SDL_Renderer *main_renderer;
 static SDL_Renderer **extra_renderers;
 static SDL_Texture  **sdl_textures;
+static window_close_handler *close_handlers;
 static uint8_t num_textures;
 static SDL_Rect      main_clip;
 static SDL_GLContext *main_context;
@@ -40,6 +46,7 @@ static uint8_t scanlines = 0;
 
 static uint32_t last_frame = 0;
 
+static uint8_t output_channels;
 static uint32_t buffer_samples, sample_rate;
 static uint32_t missing_count;
 
@@ -78,23 +85,28 @@ static int32_t mix_s16(audio_source *audio, void *vstream, int len)
 {
 	int samples = len/(sizeof(int16_t)*2);
 	int16_t *stream = vstream;
-	int16_t *end = stream + 2*samples;
+	int16_t *end = stream + output_channels*samples;
 	int16_t *src = audio->front;
 	uint32_t i = audio->read_start;
 	uint32_t i_end = audio->read_end;
 	int16_t *cur = stream;
+	size_t first_add = output_channels > 1 ? 1 : 0, second_add = output_channels > 1 ? output_channels - 1 : 1;
 	if (audio->num_channels == 1) {
 		while (cur < end && i != i_end)
 		{
-			*(cur++) += src[i];
-			*(cur++) += src[i++];
+			*cur += src[i];
+			cur += first_add;
+			*cur += src[i++];
+			cur += second_add;
 			i &= audio->mask;
 		}
 	} else {
 		while (cur < end && i != i_end)
 		{
-			*(cur++) += src[i++];
-			*(cur++) += src[i++];
+			*cur += src[i++];
+			cur += first_add;
+			*cur += src[i++];
+			cur += second_add;
 			i &= audio->mask;
 		}
 	}
@@ -122,18 +134,23 @@ static int32_t mix_f32(audio_source *audio, void *vstream, int len)
 	uint32_t i = audio->read_start;
 	uint32_t i_end = audio->read_end;
 	float *cur = stream;
+	size_t first_add = output_channels > 1 ? 1 : 0, second_add = output_channels > 1 ? output_channels - 1 : 1;
 	if (audio->num_channels == 1) {
 		while (cur < end && i != i_end)
 		{
-			*(cur++) += ((float)src[i]) / 0x7FFF;
-			*(cur++) += ((float)src[i++]) / 0x7FFF;
+			*cur += ((float)src[i]) / 0x7FFF;
+			cur += first_add;
+			*cur += ((float)src[i++]) / 0x7FFF;
+			cur += second_add;
 			i &= audio->mask;
 		}
 	} else {
 		while(cur < end && i != i_end)
 		{
-			*(cur++) += ((float)src[i++]) / 0x7FFF;
-			*(cur++) += ((float)src[i++]) / 0x7FFF;
+			*cur += ((float)src[i++]) / 0x7FFF;
+			cur += first_add;
+			*cur += ((float)src[i++]) / 0x7FFF;
+			cur += second_add;
 			i &= audio->mask;
 		}
 	}
@@ -436,7 +453,11 @@ int render_fullscreen()
 
 uint32_t render_map_color(uint8_t r, uint8_t g, uint8_t b)
 {
+#ifdef USE_GLES
+	return 255 << 24 | b << 16 | g << 8 | r;
+#else
 	return 255 << 24 | r << 16 | g << 8 | b;
+#endif
 }
 
 #ifndef DISABLE_OPENGL
@@ -453,29 +474,49 @@ static GLfloat vertex_data[8];
 
 static const GLushort element_data[] = {0, 1, 2, 3};
 
+static const GLchar shader_prefix[] =
+#ifdef USE_GLES
+	"#version 100\n";
+#else
+	"#version 110\n"
+	"#define lowp\n"
+	"#define mediump\n"
+	"#define highp\n";
+#endif
+
 static GLuint load_shader(char * fname, GLenum shader_type)
 {
 	char const * parts[] = {get_home_dir(), "/.config/blastem/shaders/", fname};
 	char * shader_path = alloc_concat_m(3, parts);
 	FILE * f = fopen(shader_path, "rb");
 	free(shader_path);
-	if (!f) {
-		parts[0] = get_exe_dir();
-		parts[1] = "/shaders/";
-		shader_path = alloc_concat_m(3, parts);
-		f = fopen(shader_path, "rb");
+	GLchar * text;
+	long fsize;
+	if (f) {
+		fsize = file_size(f);
+		text = malloc(fsize);
+		if (fread(text, 1, fsize, f) != fsize) {
+			warning("Error reading from shader file %s\n", fname);
+			free(text);
+			return 0;
+		}
+	} else {
+		shader_path = path_append("shaders", fname);
+		uint32_t fsize32;
+		text = read_bundled_file(shader_path, &fsize32);
 		free(shader_path);
-		if (!f) {
+		if (!text) {
 			warning("Failed to open shader file %s for reading\n", fname);
 			return 0;
 		}
+		fsize = fsize32;
 	}
-	long fsize = file_size(f);
-	GLchar * text = malloc(fsize);
-	if (fread(text, 1, fsize, f) != fsize) {
-		warning("Error reading from shader file %s\n", fname);
-		free(text);
-		return 0;
+	
+	if (strncmp(text, "#version", strlen("#version"))) {
+		GLchar *tmp = text;
+		text = alloc_concat(shader_prefix, tmp);
+		free(tmp);
+		fsize += strlen(shader_prefix);
 	}
 	GLuint ret = glCreateShader(shader_type);
 	glShaderSource(ret, 1, (const GLchar **)&text, (const GLint *)&fsize);
@@ -498,6 +539,15 @@ static GLuint load_shader(char * fname, GLenum shader_type)
 
 static uint32_t texture_buf[512 * 513];
 #ifndef DISABLE_OPENGL
+#ifdef USE_GLES
+#define INTERNAL_FORMAT GL_RGBA
+#define SRC_FORMAT GL_RGBA
+#define RENDER_FORMAT SDL_PIXELFORMAT_ABGR8888
+#else
+#define INTERNAL_FORMAT GL_RGBA8
+#define SRC_FORMAT GL_BGRA
+#define RENDER_FORMAT SDL_PIXELFORMAT_ARGB8888
+#endif
 static void gl_setup()
 {
 	tern_val def = {.ptrval = "linear"};
@@ -513,10 +563,10 @@ static void gl_setup()
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 		if (i < 2) {
 			//TODO: Fixme for PAL + invalid display mode
-			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 512, 512, 0, GL_BGRA, GL_UNSIGNED_BYTE, texture_buf);
+			glTexImage2D(GL_TEXTURE_2D, 0, INTERNAL_FORMAT, 512, 512, 0, SRC_FORMAT, GL_UNSIGNED_BYTE, texture_buf);
 		} else {
 			uint32_t blank = 255 << 24;
-			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_BGRA, GL_UNSIGNED_BYTE, &blank);
+			glTexImage2D(GL_TEXTURE_2D, 0, INTERNAL_FORMAT, 1, 1, 0, SRC_FORMAT, GL_UNSIGNED_BYTE, &blank);
 		}
 	}
 	glGenBuffers(2, buffers);
@@ -574,7 +624,7 @@ static void render_alloc_surfaces()
 		char *scaling = tern_find_path_default(config, "video\0scaling\0", def, TVAL_PTR).ptrval;
 		SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, scaling);
 		//TODO: Fixme for invalid display mode
-		sdl_textures[0] = sdl_textures[1] = SDL_CreateTexture(main_renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, LINEBUF_SIZE, 588);
+		sdl_textures[0] = sdl_textures[1] = SDL_CreateTexture(main_renderer, RENDER_FORMAT, SDL_TEXTUREACCESS_STREAMING, LINEBUF_SIZE, 588);
 #ifndef DISABLE_OPENGL
 	}
 #endif
@@ -921,6 +971,21 @@ static int32_t handle_event(SDL_Event *event)
 			}
 #endif
 			break;
+		case SDL_WINDOWEVENT_CLOSE:
+			if (SDL_GetWindowID(main_window) == event->window.windowID) {
+				exit(0);
+			} else {
+				for (int i = 0; i < num_textures - FRAMEBUFFER_USER_START; i++)
+				{
+					if (SDL_GetWindowID(extra_windows[i]) == event->window.windowID) {
+						if (close_handlers[i]) {
+							close_handlers[i](i + FRAMEBUFFER_USER_START);
+						}
+						break;
+					}
+				}
+			}
+			break;
 		}
 		break;
 	case SDL_DROPFILE:
@@ -978,6 +1043,7 @@ static void init_audio()
 	}
 	buffer_samples = actual.samples;
 	sample_rate = actual.freq;
+	output_channels = actual.channels;
 	printf("Initialized audio at frequency %d with a %d sample buffer, ", actual.freq, actual.samples);
 	if (actual.format == AUDIO_S16SYS) {
 		puts("signed 16-bit int format");
@@ -999,7 +1065,7 @@ void window_setup(void)
 		flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
 	}
 	
-	tern_val def = {.ptrval = "video"};
+	tern_val def = {.ptrval = "audio"};
 	char *sync_src = tern_find_path_default(config, "system\0sync_source\0", def, TVAL_PTR).ptrval;
 	sync_to_audio = !strcmp(sync_src, "audio");
 	
@@ -1050,6 +1116,11 @@ void window_setup(void)
 		SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 5);
 		SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
 		SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+#ifdef USE_GLES
+		SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+#endif
 	}
 #endif
 	main_window = SDL_CreateWindow(caption, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, main_width, main_height, flags);
@@ -1060,13 +1131,19 @@ void window_setup(void)
 	if (gl_enabled)
 	{
 		main_context = SDL_GL_CreateContext(main_window);
+#ifdef USE_GLES
+		int major_version;
+		if (SDL_GL_GetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, &major_version) == 0 && major_version >= 2) {
+#else
 		GLenum res = glewInit();
 		if (res != GLEW_OK) {
 			warning("Initialization of GLEW failed with code %d\n", res);
 		}
 
 		if (res == GLEW_OK && GLEW_VERSION_2_0) {
+#endif
 			render_gl = 1;
+			SDL_GL_MakeCurrent(main_window, main_context);
 			if (!strcmp("tear", vsync)) {
 				if (SDL_GL_SetSwapInterval(-1) < 0) {
 					warning("late tear is not available (%s), using normal vsync\n", SDL_GetError());
@@ -1095,6 +1172,9 @@ void window_setup(void)
 		if (!main_renderer) {
 			fatal_error("unable to create SDL renderer: %s\n", SDL_GetError());
 		}
+		SDL_RendererInfo rinfo;
+		SDL_GetRendererInfo(main_renderer, &rinfo);
+		printf("SDL2 Render Driver: %s\n", rinfo.name);
 		main_clip.x = main_clip.y = 0;
 		main_clip.w = main_width;
 		main_clip.h = main_height;
@@ -1302,7 +1382,7 @@ void render_set_video_standard(vid_std std)
 	source_frame = 0;
 	source_frame_count = frame_repeat[0];
 	//sync samples with audio thread approximately every 8 lines
-	sync_samples = sync_to_audio ? buffer_samples : 8 * sample_rate / (source_hz * (VID_PAL ? 313 : 262));
+	sync_samples = sync_to_audio ? buffer_samples : 8 * sample_rate / (source_hz * (std == VID_PAL ? 313 : 262));
 	max_repeat++;
 	min_buffered = (((float)max_repeat * (float)sample_rate/(float)source_hz)/* / (float)buffer_samples*/);// + 0.9999;
 	//min_buffered *= buffer_samples;
@@ -1326,7 +1406,7 @@ void render_save_screenshot(char *path)
 	screenshot_path = path;
 }
 
-uint8_t render_create_window(char *caption, uint32_t width, uint32_t height)
+uint8_t render_create_window(char *caption, uint32_t width, uint32_t height, window_close_handler close_handler)
 {
 	uint8_t win_idx = 0xFF;
 	for (int i = 0; i < num_textures - FRAMEBUFFER_USER_START; i++)
@@ -1342,6 +1422,7 @@ uint8_t render_create_window(char *caption, uint32_t width, uint32_t height)
 		sdl_textures = realloc(sdl_textures, num_textures * sizeof(*sdl_textures));
 		extra_windows = realloc(extra_windows, (num_textures - FRAMEBUFFER_USER_START) * sizeof(*extra_windows));
 		extra_renderers = realloc(extra_renderers, (num_textures - FRAMEBUFFER_USER_START) * sizeof(*extra_renderers));
+		close_handlers = realloc(close_handlers, (num_textures - FRAMEBUFFER_USER_START) * sizeof(*close_handlers));
 		win_idx = num_textures - FRAMEBUFFER_USER_START - 1;
 	}
 	extra_windows[win_idx] = SDL_CreateWindow(caption, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, width, height, 0);
@@ -1357,6 +1438,7 @@ uint8_t render_create_window(char *caption, uint32_t width, uint32_t height)
 	if (!sdl_textures[texture_idx]) {
 		goto fail_texture;
 	}
+	close_handlers[win_idx] = close_handler;
 	return texture_idx;
 	
 fail_texture:
@@ -1466,7 +1548,7 @@ void render_framebuffer_updated(uint8_t which, int width)
 	if (render_gl && which <= FRAMEBUFFER_EVEN) {
 		SDL_GL_MakeCurrent(main_window, main_context);
 		glBindTexture(GL_TEXTURE_2D, textures[which]);
-		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, LINEBUF_SIZE, height, GL_BGRA, GL_UNSIGNED_BYTE, texture_buf + overscan_left[video_standard] + LINEBUF_SIZE * overscan_top[video_standard]);
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, LINEBUF_SIZE, height, SRC_FORMAT, GL_UNSIGNED_BYTE, texture_buf + overscan_left[video_standard] + LINEBUF_SIZE * overscan_top[video_standard]);
 		
 		if (screenshot_file) {
 			//properly supporting interlaced modes here is non-trivial, so only save the odd field for now

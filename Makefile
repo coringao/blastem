@@ -31,23 +31,44 @@ TERMINAL:=terminal.o
 NET:=net.o
 EXE:=
 
+HAS_PROC:=$(shell if [ -d /proc ]; then /bin/echo -e -DHAS_PROC; fi)
+CFLAGS:=-std=gnu99 -Wreturn-type -Werror=return-type -Werror=implicit-function-declaration -Wno-unused-value $(HAS_PROC) -DHAVE_UNISTD_H
+
 ifeq ($(OS),Darwin)
 LIBS=sdl2 glew
 FONT:=nuklear_ui/font_mac.o
 else
+ifdef USE_GLES
+LIBS=sdl2 glesv2
+CFLAGS+= -DUSE_GLES
+else
 LIBS=sdl2 glew gl
+endif #USE_GLES
 FONT:=nuklear_ui/font.o
 endif #Darwin
 
-HAS_PROC:=$(shell if [ -d /proc ]; then /bin/echo -e -DHAS_PROC; fi)
-CFLAGS:=-std=gnu99 -Wreturn-type -Werror=return-type -Werror=implicit-function-declaration -Wno-unused-value $(HAS_PROC) -DHAVE_UNISTD_H
+ifdef HOST_ZLIB
+LIBS+= zlib
+LIBZOBJS=
+else
+LIBZOBJS=zlib/adler32.o zlib/compress.o zlib/crc32.o zlib/deflate.o zlib/gzclose.o zlib/gzlib.o zlib/gzread.o\
+	zlib/gzwrite.o zlib/infback.o zlib/inffast.o zlib/inflate.o zlib/inftrees.o zlib/trees.o zlib/uncompr.o zlib/zutil.o
+endif
+
 ifeq ($(OS),Darwin)
 #This should really be based on whether or not the C compiler is clang rather than based on the OS
 CFLAGS+= -Wno-logical-op-parentheses
 endif
 ifdef PORTABLE
+ifdef USE_GLES
+ifndef GLES_LIB
+GLES_LIB:=$(shell pkg-config --libs glesv2)
+endif
+LDFLAGS:=-lm $(GLES_LIB)
+else
 CFLAGS+= -DGLEW_STATIC -Iglew/include
 LDFLAGS:=-lm glew/lib/libGLEW.a
+endif
 
 ifeq ($(OS),Darwin)
 CFLAGS+= -IFrameworks/SDL2.framework/Headers
@@ -55,12 +76,19 @@ LDFLAGS+= -FFrameworks -framework SDL2 -framework OpenGL -framework AppKit
 FIXUP:=install_name_tool -change @rpath/SDL2.framework/Versions/A/SDL2 @executable_path/Frameworks/SDL2.framework/Versions/A/SDL2
 else
 CFLAGS+= -Isdl/include
-LDFLAGS+= -Wl,-rpath='$$ORIGIN/lib' -Llib -lSDL2 $(shell pkg-config --libs gl)
+LDFLAGS+= -Wl,-rpath='$$ORIGIN/lib' -Llib -lSDL2
+ifndef USE_GLES
+LDFLAGS+= $(shell pkg-config --libs gl)
+endif
 endif #Darwin
 
 else
+ifeq ($(MAKECMDGOALS),libblastem.so)
+LDFLAGS:=-lm
+else
 CFLAGS:=$(shell pkg-config --cflags-only-I $(LIBS)) $(CFLAGS)
 LDFLAGS:=-lm $(shell pkg-config --libs $(LIBS))
+endif #libblastem.so
 
 ifeq ($(OS),Darwin)
 LDFLAGS+= -framework OpenGL -framework AppKit
@@ -69,6 +97,7 @@ endif
 endif #PORTABLE
 endif #Windows
 
+ifndef OPT
 ifdef DEBUG
 OPT:=-g3 -O0
 else
@@ -78,6 +107,7 @@ else
 OPT:=-O2 -flto
 endif #NOLTO
 endif #DEBUG
+endif #OPT
 
 CFLAGS:=$(OPT) $(CFLAGS)
 LDFLAGS:=$(OPT) $(LDFLAGS)
@@ -136,8 +166,6 @@ AUDIOOBJS=ym2612.o psg.o wave.o
 CONFIGOBJS=config.o tern.o util.o paths.o 
 NUKLEAROBJS=$(FONT) nuklear_ui/blastem_nuklear.o nuklear_ui/sfnt.o controller_info.o
 RENDEROBJS=render_sdl.o ppm.o
-LIBZOBJS=zlib/adler32.o zlib/compress.o zlib/crc32.o zlib/deflate.o zlib/gzclose.o zlib/gzlib.o zlib/gzread.o\
-	zlib/gzwrite.o zlib/infback.o zlib/inffast.o zlib/inflate.o zlib/inftrees.o zlib/trees.o zlib/uncompr.o zlib/zutil.o
 	
 ifdef NOZLIB
 CFLAGS+= -DDISABLE_ZLIB
@@ -149,6 +177,10 @@ endif
 MAINOBJS=blastem.o system.o genesis.o vdp.o $(RENDEROBJS) io.o romdb.o hash.o menu.o xband.o \
 	realtec.o i2c.o nor.o sega_mapper.o multi_game.o megawifi.o $(NET) serialize.o $(TERMINAL) $(CONFIGOBJS) \
 	$(M68KOBJS) $(TRANSOBJS) $(AUDIOOBJS) saves.o zip.o bindings.o jcart.o
+
+LIBOBJS=libblastem.o system.o genesis.o debug.o gdb_remote.o vdp.o io.o romdb.o hash.o menu.o xband.o realtec.o \
+	i2c.o nor.o sega_mapper.o multi_game.o megawifi.o $(NET) serialize.o $(TERMINAL) $(CONFIGOBJS) gst.o \
+	$(M68KOBJS) $(TRANSOBJS) $(AUDIOOBJS) saves.o jcart.o
 	
 ifdef NONUKLEAR
 CFLAGS+= -DDISABLE_NUKLEAR
@@ -172,10 +204,19 @@ ifdef NOZ80
 CFLAGS+=-DNO_Z80
 else
 MAINOBJS+= sms.o $(Z80OBJS)
+LIBOBJS+= sms.o $(Z80OBJS)
 endif
 
 ifeq ($(OS),Windows)
 MAINOBJS+= res.o
+endif
+
+ifdef CONFIG_PATH
+CFLAGS+= -DCONFIG_PATH='"'$(CONFIG_PATH)'"'
+endif
+
+ifdef DATA_PATH
+CFLAGS+= -DDATA_PATH='"'$(DATA_PATH)'"'
 endif
 
 ALL=dis$(EXE) zdis$(EXE) stateview$(EXE) vgmplay$(EXE) blastem$(EXE)
@@ -183,7 +224,14 @@ ifneq ($(OS),Windows)
 ALL+= termhelper
 endif
 
+ifeq ($(MAKECMDGOALS),libblastem.so)
+CFLAGS+= -fpic -DIS_LIB
+endif
+
 all : $(ALL)
+
+libblastem.so : $(LIBOBJS)
+	$(CC) -shared -o $@ $^ $(LDFLAGS)
 
 blastem$(EXE) : $(MAINOBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)

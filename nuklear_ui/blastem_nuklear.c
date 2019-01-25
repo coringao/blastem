@@ -139,7 +139,7 @@ void view_file_browser(struct nk_context *context, uint8_t normal_open)
 					free(full_path);
 				}
 				clear_view_stack();
-				current_view = view_play;
+				show_play_view();
 			}
 			selected_entry = -1;
 		}
@@ -160,7 +160,7 @@ void view_lock_on(struct nk_context *context)
 void view_about(struct nk_context *context)
 {
 	const char *lines[] = {
-		"BlastEm v0.6.0",
+		"BlastEm v0.6.1",
 		"Copyright 2012-2017 Michael Pavone",
 		"",
 		"BlastEm is a high performance open source",
@@ -168,12 +168,14 @@ void view_about(struct nk_context *context)
 	};
 	const uint32_t NUM_LINES = sizeof(lines)/sizeof(*lines);
 	const char *thanks[] = {
-		"Nemesis: Documentatino and test ROMs",
+		"Nemesis: Documentation and test ROMs",
 		"Charles MacDonald: Documentation",
 		"Eke-Eke: Documentation",
 		"Bart Trzynadlowski: Documentation",
 		"KanedaFR: Hosting the best Sega forum",
 		"Titan: Awesome demos and documentation",
+		"flamewing: BCD info and test ROM",
+		"r57shell: Opcode size test ROM",
 		"micky: Testing",
 		"Sasha: Testing",
 		"lol-frank: Testing",
@@ -244,12 +246,12 @@ void view_choose_state(struct nk_context *context, uint8_t is_load)
 		if (is_load) {
 			if (nk_button_label(context, "Load")) {
 				current_system->load_state(current_system, selected_slot);
-				current_view = view_play;
+				show_play_view();
 			}
 		} else {
 			if (nk_button_label(context, "Save")) {
 				current_system->save_state = selected_slot + 1;
-				current_view = view_play;
+				show_play_view();
 			}
 		}
 		nk_end(context);
@@ -290,6 +292,8 @@ static void menu(struct nk_context *context, uint32_t num_entries, const menu_it
 				if (current_view == view_save_state || current_view == view_load_state) {
 					free_slot_info(slots);
 					slots = NULL;
+				} else if (current_view == view_play) {
+					set_content_binding_state(1);
 				}
 			} else {
 				handler(i);
@@ -442,10 +446,12 @@ void view_key_bindings(struct nk_context *context)
 		"Set Speed 5", "Set Speed 6", "Set Speed 7", "Set Speed 8", "Set Speed 9"
 	};
 	const char *debug_binds[] = {
-		"ui.enter_debugger", "ui.vdp_debug_mode", "ui.vdp_debug_pal"
+		"ui.enter_debugger", "ui.plane_debug", "ui.vram_debug", "ui.cram_debug",
+		"ui.compositing_debug", "ui.vdp_debug_mode"
 	};
 	const char *debug_names[] = {
-		"Enter Debugger", "VDP Debug Mode", "Debug Palette"
+		"CPU Debugger", "Plane Debugger", "VRAM Debugger", "CRAM Debugger", 
+		"Layer Debugger", "Cycle Mode/Pal"
 	};
 	const uint32_t NUM_C1_BINDS = sizeof(controller1_binds)/sizeof(*controller1_binds);
 	const uint32_t NUM_C2_BINDS = sizeof(controller2_binds)/sizeof(*controller2_binds);
@@ -1052,7 +1058,7 @@ void view_controller_bindings(struct nk_context *context)
 			selected_controller_info.variant == VARIANT_6B_BUMPERS ? 1 : 2, 
 			(int[]){
 			selected_controller_info.variant == VARIANT_6B_RIGHT ? SDL_CONTROLLER_BUTTON_LEFTSHOULDER : SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,
-			selected_controller_info.variant == VARIANT_6B_RIGHT ? SDL_CONTROLLER_BUTTON_RIGHTSHOULDER : AXIS | SDL_CONTROLLER_AXIS_TRIGGERRIGHT
+			AXIS | SDL_CONTROLLER_AXIS_TRIGGERLEFT
 		});
 		
 		binding_box(context, bindings, "Misc Buttons", (render_width() - bind_box_width) / 2, font->height/2, bind_box_width, 3, (int[]){
@@ -1094,7 +1100,7 @@ void view_controller_bindings(struct nk_context *context)
 			selected_controller_info.variant == VARIANT_6B_BUMPERS ? 1 : 2, 
 			(int[]){
 			selected_controller_info.variant == VARIANT_6B_RIGHT ? SDL_CONTROLLER_BUTTON_LEFTSTICK : SDL_CONTROLLER_BUTTON_LEFTSHOULDER,
-			selected_controller_info.variant == VARIANT_6B_RIGHT ? SDL_CONTROLLER_BUTTON_RIGHTSTICK : AXIS | SDL_CONTROLLER_AXIS_TRIGGERLEFT
+			SDL_CONTROLLER_BUTTON_RIGHTSTICK
 		});
 		
 		binding_box(context, bindings, "D-pad", dpad_left, dpad_top, bind_box_width, 4, (int[]){
@@ -1145,28 +1151,51 @@ static void start_mapping(void)
 static void view_controller_mappings(struct nk_context *context)
 {
 	char buffer[512];
-	static int quiet;
+	static int quiet, button_a = -1, button_a_axis = -1;
 	uint8_t added_mapping = 0;
 	if (nk_begin(context, "Controllers", nk_rect(0, 0, render_width(), render_height()), NK_WINDOW_NO_SCROLLBAR)) {
-		nk_layout_row_static(context, render_height() - context->style.font->height, render_width() - context->style.font->height, 1);
+		
+		nk_layout_space_begin(context, NK_STATIC, render_height() - context->style.font->height, 3);
+		
 		if (current_button < SDL_CONTROLLER_BUTTON_MAX) {
 			snprintf(buffer, sizeof(buffer), "Press Button %s", get_button_label(&selected_controller_info, current_button));
 		} else {
 			snprintf(buffer, sizeof(buffer), "Move Axis %s", get_axis_label(&selected_controller_info, current_axis));
 		}
+		
+		float height = context->style.font->height * 1.25;
+		float top = render_height()/2 - 1.5 * height;
+		float width = render_width() - context->style.font->height;
+		
+		nk_layout_space_push(context, nk_rect(0, top, width, height));
 		nk_label(context, buffer, NK_TEXT_CENTERED);
+		if (current_button > SDL_CONTROLLER_BUTTON_B) {
+			nk_layout_space_push(context, nk_rect(0, top + height, width, height));
+			nk_label(context, "OR", NK_TEXT_CENTERED);
+		
+			nk_layout_space_push(context, nk_rect(0, top + 2.0 * height, width, height));
+			snprintf(buffer, sizeof(buffer), "Press Button %s to skip", get_button_label(&selected_controller_info, SDL_CONTROLLER_BUTTON_A));
+			nk_label(context, buffer, NK_TEXT_CENTERED);
+		}
+		
+		nk_layout_space_end(context);
 		if (quiet) {
 			--quiet;
 		} else {
 			if (button_pressed >= 0 && button_pressed != last_button) {
-				start_mapping();
-				mapping_string[mapping_pos++] = 'b';
-				if (button_pressed > 9) {
-					mapping_string[mapping_pos++] = '0' + button_pressed / 10;
+				if (current_button <= SDL_CONTROLLER_BUTTON_B || button_pressed != button_a) {
+					start_mapping();
+					mapping_string[mapping_pos++] = 'b';
+					if (button_pressed > 9) {
+						mapping_string[mapping_pos++] = '0' + button_pressed / 10;
+					}
+					mapping_string[mapping_pos++] = '0' + button_pressed % 10;
+					last_button = button_pressed;
+					if (current_button == SDL_CONTROLLER_BUTTON_A) {
+						button_a = button_pressed;
+					}
 				}
-				mapping_string[mapping_pos++] = '0' + button_pressed % 10;
 				added_mapping = 1;
-				last_button = button_pressed;
 			} else if (hat_moved >= 0 && hat_value && (hat_moved != last_hat || hat_value != last_hat_value)) {
 				start_mapping();
 				mapping_string[mapping_pos++] = 'h';
@@ -1178,14 +1207,16 @@ static void view_controller_mappings(struct nk_context *context)
 				last_hat = hat_moved;
 				last_hat_value = hat_value;
 			} else if (axis_moved >= 0 && abs(axis_value) > 1000 && axis_moved != last_axis) {
-				start_mapping();
-				mapping_string[mapping_pos++] = 'a';
-				if (axis_moved > 9) {
-					mapping_string[mapping_pos++] = '0' + axis_moved / 10;
+				if (current_button <= SDL_CONTROLLER_BUTTON_B || axis_moved != button_a_axis) {
+					start_mapping();
+					mapping_string[mapping_pos++] = 'a';
+					if (axis_moved > 9) {
+						mapping_string[mapping_pos++] = '0' + axis_moved / 10;
+					}
+					mapping_string[mapping_pos++] = '0' + axis_moved % 10;
+					last_axis = axis_moved;
 				}
-				mapping_string[mapping_pos++] = '0' + axis_moved % 10;
 				added_mapping = 1;
-				last_axis = axis_moved;
 			}
 		}
 			
@@ -1199,6 +1230,8 @@ static void view_controller_mappings(struct nk_context *context)
 			} else {
 				current_axis++;
 				if (current_axis == SDL_CONTROLLER_AXIS_MAX) {
+					button_a = -1;
+					button_a_axis = -1;
 					mapping_string[mapping_pos] = 0;
 					save_controller_mapping(selected_controller, mapping_string);
 					free(mapping_string);
@@ -1479,7 +1512,11 @@ shader_prog *get_shader_list(uint32_t *num_out)
 		progs = NULL;
 		prog_storage = 0;
 	}
+#ifdef DATA_PATH
+	shader_dir = path_append(DATA_PATH, "shaders");
+#else
 	shader_dir = path_append(get_exe_dir(), "shaders");
+#endif
 	entries = get_dir_list(shader_dir, &num_entries);
 	progs = get_shader_progs(entries, num_entries, progs, &num_progs, &prog_storage);
 	*num_out = num_progs;
@@ -1789,10 +1826,12 @@ void view_menu(struct nk_context *context)
 
 void blastem_nuklear_render(void)
 {
-	nk_input_end(context);
-	current_view(context);
-	nk_sdl_render(NK_ANTI_ALIASING_ON, 512 * 1024, 128 * 1024);
-	nk_input_begin(context);
+	if (current_view != view_play) {
+		nk_input_end(context);
+		current_view(context);
+		nk_sdl_render(NK_ANTI_ALIASING_ON, 512 * 1024, 128 * 1024);
+		nk_input_begin(context);
+	}
 }
 
 void ui_idle_loop(void)
@@ -1837,7 +1876,11 @@ static void handle_event(SDL_Event *event)
 
 static void context_destroyed(void)
 {
-	nk_sdl_shutdown();
+	if (context)
+	{
+		nk_sdl_shutdown();
+		context = NULL;
+	}
 }
 
 static struct nk_image load_image_texture(uint32_t *buf, uint32_t width, uint32_t height)
@@ -1849,7 +1892,11 @@ static struct nk_image load_image_texture(uint32_t *buf, uint32_t width, uint32_
 	glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 	glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+#ifdef USE_GLES
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+#else
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_BGRA, GL_UNSIGNED_BYTE, buf);
+#endif
 	return nk_image_id((int)tex);
 }
 
@@ -1880,6 +1927,7 @@ static void context_created(void)
 
 void show_pause_menu(void)
 {
+	set_content_binding_state(0);
 	context->style.window.background = nk_rgba(0, 0, 0, 128);
 	context->style.window.fixed_background = nk_style_item_color(nk_rgba(0, 0, 0, 128));
 	current_view = view_pause;
@@ -1888,6 +1936,7 @@ void show_pause_menu(void)
 
 void show_play_view(void)
 {
+	set_content_binding_state(1);
 	current_view = view_play;
 }
 
@@ -1929,6 +1978,14 @@ ui_image *load_ui_image(char *name)
 		}
 		ui_image *this_image = ui_images[num_ui_images-1] = calloc(1, sizeof(ui_image));
 		this_image->image_data = load_png(buf, buf_size, &this_image->width, &this_image->height);
+#ifdef USE_GLES
+		uint32_t *cur = this_image->image_data;
+		for (int i = 0; i < this_image->width*this_image->height; i++, cur++)
+		{
+			uint32_t pixel = *cur;
+			*cur = (pixel & 0xFF00FF00) | (pixel << 16 & 0xFF0000) | (pixel >> 16 & 0xFF);
+		}
+#endif
 		free(buf);
 		if (!this_image->image_data) {
 			num_ui_images--;
@@ -1951,7 +2008,12 @@ void blastem_nuklear_init(uint8_t file_loaded)
 	
 	texture_init();
 	
-	current_view = file_loaded ? view_play : view_menu;
+	if (file_loaded) {
+		current_view = view_play;
+	} else {
+		current_view = view_menu;
+		set_content_binding_state(0);
+	}
 	render_set_ui_render_fun(blastem_nuklear_render);
 	render_set_event_handler(handle_event);
 	render_set_gl_context_handlers(context_destroyed, context_created);

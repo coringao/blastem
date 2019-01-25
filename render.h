@@ -6,7 +6,7 @@
 #ifndef RENDER_H_
 #define RENDER_H_
 
-//TODO: Throw an ifdef in here once there's more than one renderer
+#ifndef IS_LIB
 #include <SDL.h>
 #define RENDERKEY_UP       SDLK_UP
 #define RENDERKEY_DOWN     SDLK_DOWN
@@ -61,6 +61,7 @@
 #define RENDER_DPAD_LEFT   SDL_HAT_LEFT
 #define RENDER_DPAD_RIGHT  SDL_HAT_RIGHT
 #define render_relative_mouse SDL_SetRelativeMouseMode
+#endif
 
 #define MAX_JOYSTICKS 8
 #define MAX_MICE 8
@@ -86,10 +87,11 @@ typedef enum {
 
 typedef struct audio_source audio_source;
 typedef void (*drop_handler)(const char *filename);
+typedef void (*window_close_handler)(uint8_t which);
 
 uint32_t render_map_color(uint8_t r, uint8_t g, uint8_t b);
 void render_save_screenshot(char *path);
-uint8_t render_create_window(char *caption, uint32_t width, uint32_t height);
+uint8_t render_create_window(char *caption, uint32_t width, uint32_t height, window_close_handler close_handler);
 void render_destroy_window(uint8_t which);
 uint32_t *render_get_framebuffer(uint8_t which, int *pitch);
 void render_framebuffer_updated(uint8_t which, int width);

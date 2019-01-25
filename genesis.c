@@ -33,7 +33,11 @@ uint32_t MCLKS_PER_68K;
 #define LINES_NTSC 262
 #define LINES_PAL 313
 
+#ifdef IS_LIB
+#define MAX_SOUND_CYCLES 1000
+#else
 #define MAX_SOUND_CYCLES 100000	
+#endif
 
 void genesis_serialize(genesis_context *gen, serialize_buffer *buf, uint32_t m68k_pc)
 {
@@ -86,6 +90,31 @@ void genesis_serialize(genesis_context *gen, serialize_buffer *buf, uint32_t m68
 	end_section(buf);
 	
 	cart_serialize(&gen->header, buf);
+}
+
+static uint8_t *serialize(system_header *sys, size_t *size_out)
+{
+	genesis_context *gen = (genesis_context *)sys;
+	uint32_t address;
+	if (gen->m68k->resume_pc) {
+		gen->m68k->target_cycle = gen->m68k->current_cycle;
+		gen->header.save_state = SERIALIZE_SLOT+1;
+		resume_68k(gen->m68k);
+		if (size_out) {
+			*size_out = gen->serialize_size;
+		}
+		return gen->serialize_tmp;
+	} else {
+		serialize_buffer state;
+		init_serialize(&state);
+		uint32_t address = read_word(4, (void **)gen->m68k->mem_pointers, &gen->m68k->options->gen, gen->m68k) << 16;
+		address |= read_word(6, (void **)gen->m68k->mem_pointers, &gen->m68k->options->gen, gen->m68k);
+		genesis_serialize(gen, &state, address);
+		if (size_out) {
+			*size_out = state.size;
+		}
+		return state.data;
+	}
 }
 
 static void ram_deserialize(deserialize_buffer *buf, void *vgen)
@@ -148,6 +177,19 @@ void genesis_deserialize(deserialize_buffer *buf, genesis_context *gen)
 	}
 	update_z80_bank_pointer(gen);
 	adjust_int_cycle(gen->m68k, gen->vdp);
+	free(buf->handlers);
+	buf->handlers = NULL;
+}
+
+#include "m68k_internal.h" //needed for get_native_address_trans, should be eliminated once handling of PC is cleaned up
+static void deserialize(system_header *sys, uint8_t *data, size_t size)
+{
+	genesis_context *gen = (genesis_context *)sys;
+	deserialize_buffer buffer;
+	init_deserialize(&buffer, data, size);
+	genesis_deserialize(&buffer, gen);
+	//HACK: Fix this once PC/IR is represented in a better way in 68K core
+	gen->m68k->resume_pc = get_native_address_trans(gen->m68k, gen->m68k->last_prefetch_address);
 }
 
 uint16_t read_dma_value(uint32_t address)
@@ -380,13 +422,20 @@ m68k_context * sync_components(m68k_context * context, uint32_t address)
 					sync_z80(z_context, z_context->current_cycle + MCLKS_PER_Z80);
 				}
 			}
-			char *save_path = get_slot_name(&gen->header, slot, use_native_states ? "state" : "gst");
-			if (use_native_states) {
+			char *save_path = slot == SERIALIZE_SLOT ? NULL : get_slot_name(&gen->header, slot, use_native_states ? "state" : "gst");
+			if (use_native_states || slot == SERIALIZE_SLOT) {
 				serialize_buffer state;
 				init_serialize(&state);
 				genesis_serialize(gen, &state, address);
-				save_to_file(&state, save_path);
-				free(state.data);
+				if (slot == SERIALIZE_SLOT) {
+					gen->serialize_tmp = state.data;
+					gen->serialize_size = state.size;
+					context->sync_cycle = context->current_cycle;
+					context->should_return = 1;
+				} else {
+					save_to_file(&state, save_path);
+					free(state.data);
+				}
 			} else {
 				save_gst(gen, save_path, address);
 			}
@@ -1035,7 +1084,6 @@ void set_region(genesis_context *gen, rom_info *info, uint8_t region)
 	gen->master_clock = gen->normal_clock;
 }
 
-#include "m68k_internal.h" //needed for get_native_address_trans, should be eliminated once handling of PC is cleaned up
 static uint8_t load_state(system_header *system, uint8_t slot)
 {
 	genesis_context *gen = (genesis_context *)system;
@@ -1095,10 +1143,12 @@ static void handle_reset_requests(genesis_context *gen)
 			resume_68k(gen->m68k);
 		}
 	}
+#ifndef IS_LIB
 	bindings_release_capture();
 	vdp_release_framebuffer(gen->vdp);
 	render_pause_source(gen->ym->audio);
 	render_pause_source(gen->psg->audio);
+#endif
 }
 
 static void start_genesis(system_header *system, char *statefile)
@@ -1147,11 +1197,13 @@ static void start_genesis(system_header *system, char *statefile)
 static void resume_genesis(system_header *system)
 {
 	genesis_context *gen = (genesis_context *)system;
+#ifndef IS_LIB
 	render_set_video_standard((gen->version_reg & HZ50) ? VID_PAL : VID_NTSC);
 	bindings_reacquire_capture();
 	vdp_reacquire_framebuffer(gen->vdp);
 	render_resume_source(gen->ym->audio);
 	render_resume_source(gen->psg->audio);
+#endif
 	resume_68k(gen->m68k);
 	handle_reset_requests(gen);
 }
@@ -1165,6 +1217,7 @@ static void inc_debug_mode(system_header *system)
 static void request_exit(system_header *system)
 {
 	genesis_context *gen = (genesis_context *)system;
+	gen->m68k->target_cycle = gen->m68k->current_cycle;
 	gen->m68k->should_return = 1;
 }
 
@@ -1319,6 +1372,8 @@ genesis_context *alloc_init_genesis(rom_info *rom, void *main_rom, void *lock_on
 	gen->header.keyboard_down = keyboard_down;
 	gen->header.keyboard_up = keyboard_up;
 	gen->header.config_updated = config_updated;
+	gen->header.serialize = serialize;
+	gen->header.deserialize = deserialize;
 	gen->header.type = SYSTEM_GENESIS;
 	gen->header.info = *rom;
 	set_region(gen, rom, force_region);

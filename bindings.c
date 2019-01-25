@@ -188,6 +188,12 @@ void reset_joystick_bindings(int joystick)
 	}
 }
 
+static uint8_t content_binds_enabled = 1;
+void set_content_binding_state(uint8_t enabled)
+{
+	content_binds_enabled = enabled;
+}
+
 void handle_binding_down(keybinding * binding)
 {
 	if (!current_system) {
@@ -253,15 +259,16 @@ static uint8_t mouse_captured;
 
 void handle_binding_up(keybinding * binding)
 {
+	uint8_t allow_content_binds = content_binds_enabled && current_system;
 	switch(binding->bind_type)
 	{
 	case BIND_GAMEPAD:
-		if (current_system && current_system->gamepad_up) {
+		if (allow_content_binds && current_system->gamepad_up) {
 			current_system->gamepad_up(current_system, binding->subtype_a, binding->subtype_b);
 		}
 		break;
 	case BIND_MOUSE:
-		if (current_system && current_system->mouse_up) {
+		if (allow_content_binds && current_system->mouse_up) {
 			current_system->mouse_up(current_system, binding->subtype_a, binding->subtype_b);
 		}
 		break;
@@ -269,38 +276,50 @@ void handle_binding_up(keybinding * binding)
 		switch (binding->subtype_a)
 		{
 		case UI_DEBUG_MODE_INC:
-			current_system->inc_debug_mode(current_system);
+			if (allow_content_binds) {
+				current_system->inc_debug_mode(current_system);
+			}
 			break;
 		case UI_ENTER_DEBUGGER:
-			current_system->enter_debugger = 1;
+			if (allow_content_binds) {
+				current_system->enter_debugger = 1;
+			}
 			break;
 		case UI_SAVE_STATE:
-			current_system->save_state = QUICK_SAVE_SLOT+1;
+			if (allow_content_binds) {
+				current_system->save_state = QUICK_SAVE_SLOT+1;
+			}
 			break;
 		case UI_NEXT_SPEED:
-			current_speed++;
-			if (current_speed >= num_speeds) {
-				current_speed = 0;
-			}
-			printf("Setting speed to %d: %d\n", current_speed, speeds[current_speed]);
-			current_system->set_speed_percent(current_system, speeds[current_speed]);
-			break;
-		case UI_PREV_SPEED:
-			current_speed--;
-			if (current_speed < 0) {
-				current_speed = num_speeds - 1;
-			}
-			printf("Setting speed to %d: %d\n", current_speed, speeds[current_speed]);
-			current_system->set_speed_percent(current_system, speeds[current_speed]);
-			break;
-		case UI_SET_SPEED:
-			if (binding->subtype_b < num_speeds) {
-				current_speed = binding->subtype_b;
+			if (allow_content_binds) {
+				current_speed++;
+				if (current_speed >= num_speeds) {
+					current_speed = 0;
+				}
 				printf("Setting speed to %d: %d\n", current_speed, speeds[current_speed]);
 				current_system->set_speed_percent(current_system, speeds[current_speed]);
-			} else {
-				printf("Setting speed to %d\n", speeds[current_speed]);
+			}
+			break;
+		case UI_PREV_SPEED:
+			if (allow_content_binds) {
+				current_speed--;
+				if (current_speed < 0) {
+					current_speed = num_speeds - 1;
+				}
+				printf("Setting speed to %d: %d\n", current_speed, speeds[current_speed]);
 				current_system->set_speed_percent(current_system, speeds[current_speed]);
+			}
+			break;
+		case UI_SET_SPEED:
+			if (allow_content_binds) {
+				if (binding->subtype_b < num_speeds) {
+					current_speed = binding->subtype_b;
+					printf("Setting speed to %d: %d\n", current_speed, speeds[current_speed]);
+					current_system->set_speed_percent(current_system, speeds[current_speed]);
+				} else {
+					printf("Setting speed to %d\n", speeds[current_speed]);
+					current_system->set_speed_percent(current_system, speeds[current_speed]);
+				}
 			}
 			break;
 		case UI_RELEASE_MOUSE:
@@ -310,7 +329,7 @@ void handle_binding_up(keybinding * binding)
 			}
 			break;
 		case UI_TOGGLE_KEYBOARD_CAPTURE:
-			if (current_system && current_system->has_keyboard) {
+			if (allow_content_binds && current_system->has_keyboard) {
 				keyboard_captured = !keyboard_captured;
 			}
 			break;
@@ -318,37 +337,43 @@ void handle_binding_up(keybinding * binding)
 			render_toggle_fullscreen();
 			break;
 		case UI_SOFT_RESET:
-			current_system->soft_reset(current_system);
+			if (allow_content_binds) {
+				current_system->soft_reset(current_system);
+			}
 			break;
 		case UI_RELOAD:
-			reload_media();
+			if (allow_content_binds) {
+				reload_media();
+			}
 			break;
 		case UI_SMS_PAUSE:
-			if (current_system && current_system->gamepad_down) {
+			if (allow_content_binds && current_system->gamepad_down) {
 				current_system->gamepad_down(current_system, GAMEPAD_MAIN_UNIT, MAIN_UNIT_PAUSE);
 			}
 			break;
 		case UI_SCREENSHOT: {
-			char *screenshot_base = tern_find_path(config, "ui\0screenshot_path\0", TVAL_PTR).ptrval;
-			if (!screenshot_base) {
-				screenshot_base = "$HOME";
+			if (allow_content_binds) {
+				char *screenshot_base = tern_find_path(config, "ui\0screenshot_path\0", TVAL_PTR).ptrval;
+				if (!screenshot_base) {
+					screenshot_base = "$HOME";
+				}
+				tern_node *vars = tern_insert_ptr(NULL, "HOME", get_home_dir());
+				vars = tern_insert_ptr(vars, "EXEDIR", get_exe_dir());
+				screenshot_base = replace_vars(screenshot_base, vars, 1);
+				tern_free(vars);
+				time_t now = time(NULL);
+				struct tm local_store;
+				char fname_part[256];
+				char *template = tern_find_path(config, "ui\0screenshot_template\0", TVAL_PTR).ptrval;
+				if (!template) {
+					template = "blastem_%c.ppm";
+				}
+				strftime(fname_part, sizeof(fname_part), template, localtime_r(&now, &local_store));
+				char const *parts[] = {screenshot_base, PATH_SEP, fname_part};
+				char *path = alloc_concat_m(3, parts);
+				free(screenshot_base);
+				render_save_screenshot(path);
 			}
-			tern_node *vars = tern_insert_ptr(NULL, "HOME", get_home_dir());
-			vars = tern_insert_ptr(vars, "EXEDIR", get_exe_dir());
-			screenshot_base = replace_vars(screenshot_base, vars, 1);
-			tern_free(vars);
-			time_t now = time(NULL);
-			struct tm local_store;
-			char fname_part[256];
-			char *template = tern_find_path(config, "ui\0screenshot_template\0", TVAL_PTR).ptrval;
-			if (!template) {
-				template = "blastem_%c.ppm";
-			}
-			strftime(fname_part, sizeof(fname_part), template, localtime_r(&now, &local_store));
-			char const *parts[] = {screenshot_base, PATH_SEP, fname_part};
-			char *path = alloc_concat_m(3, parts);
-			free(screenshot_base);
-			render_save_screenshot(path);
 			break;
 		}
 		case UI_EXIT:
@@ -373,29 +398,30 @@ void handle_binding_up(keybinding * binding)
 		case UI_PLANE_DEBUG: 
 		case UI_VRAM_DEBUG: 
 		case UI_CRAM_DEBUG:
-		case UI_COMPOSITE_DEBUG: {
-			vdp_context *vdp = NULL;
-			if (current_system->type == SYSTEM_GENESIS) {
-				genesis_context *gen = (genesis_context *)current_system;
-				vdp = gen->vdp;
-			} else if (current_system->type == SYSTEM_SMS) {
-				sms_context *sms = (sms_context *)current_system;
-				vdp = sms->vdp;
-			}
-			if (vdp) {
-				uint8_t debug_type;
-				switch(binding->subtype_a)
-				{
-				case UI_PLANE_DEBUG: debug_type = VDP_DEBUG_PLANE; break;
-				case UI_VRAM_DEBUG: debug_type = VDP_DEBUG_VRAM; break;
-				case UI_CRAM_DEBUG: debug_type = VDP_DEBUG_CRAM; break;
-				case UI_COMPOSITE_DEBUG: debug_type = VDP_DEBUG_COMPOSITE; break;
-				default: return;
+		case UI_COMPOSITE_DEBUG:
+			if (allow_content_binds) {
+				vdp_context *vdp = NULL;
+				if (current_system->type == SYSTEM_GENESIS) {
+					genesis_context *gen = (genesis_context *)current_system;
+					vdp = gen->vdp;
+				} else if (current_system->type == SYSTEM_SMS) {
+					sms_context *sms = (sms_context *)current_system;
+					vdp = sms->vdp;
 				}
-				vdp_toggle_debug_view(vdp, debug_type);
+				if (vdp) {
+					uint8_t debug_type;
+					switch(binding->subtype_a)
+					{
+					case UI_PLANE_DEBUG: debug_type = VDP_DEBUG_PLANE; break;
+					case UI_VRAM_DEBUG: debug_type = VDP_DEBUG_VRAM; break;
+					case UI_CRAM_DEBUG: debug_type = VDP_DEBUG_CRAM; break;
+					case UI_COMPOSITE_DEBUG: debug_type = VDP_DEBUG_COMPOSITE; break;
+					default: return;
+					}
+					vdp_toggle_debug_view(vdp, debug_type);
+				}
+				break;
 			}
-			break;
-		}
 		}
 		break;
 	}
@@ -932,14 +958,26 @@ void handle_joy_added(int joystick)
 			char numstr[2] = {dpad + '0', 0};
 			tern_node * pad_dpad = tern_find_node(dpad_node, numstr);
 			char * dirs[] = {"up", "down", "left", "right"};
-			//TODO: Support controllers that have d-pads implemented as analog axes or buttons
+			char *render_dirs[] = {"dpup", "dpdown", "dpleft", "dpright"};
 			int dirnums[] = {RENDER_DPAD_UP, RENDER_DPAD_DOWN, RENDER_DPAD_LEFT, RENDER_DPAD_RIGHT};
 			for (int dir = 0; dir < sizeof(dirs)/sizeof(dirs[0]); dir++) {
 				char * target = tern_find_ptr(pad_dpad, dirs[dir]);
 				if (target) {
 					uint8_t subtype_a = 0, subtype_b = 0;
 					int bindtype = parse_binding_target(joystick, target, get_pad_buttons(), get_mouse_buttons(), &subtype_a, &subtype_b);
-					bind_dpad(joystick, dpad, dirnums[dir], bindtype, subtype_a, subtype_b);
+					int32_t hostbutton = dpad >0 ? -1 : render_translate_input_name(joystick, render_dirs[dir], 0);
+					if (hostbutton < 0) {
+						//assume this is a raw dpad mapping
+						bind_dpad(joystick, dpad, dirnums[dir], bindtype, subtype_a, subtype_b);
+					} else if (hostbutton & RENDER_DPAD_BIT) {
+						bind_dpad(joystick, render_dpad_part(hostbutton), render_direction_part(hostbutton), bindtype, subtype_a, subtype_b);
+					} else if (hostbutton & RENDER_AXIS_BIT) {
+						//SDL2 knows internally whether this should be a positive or negative binding, but doesn't expose that externally
+						//for now I'll just assume that any controller with axes for a d-pad has these mapped the "sane" way
+						bind_axis(joystick, render_axis_part(hostbutton), dir == 1 || dir == 3 ? 1 : 0, bindtype, subtype_a, subtype_b);
+					} else {
+						bind_button(joystick, hostbutton, bindtype, subtype_a, subtype_b);
+					}
 				}
 			}
 		}

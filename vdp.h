@@ -13,6 +13,9 @@
 
 #define VDP_REGS 24
 #define CRAM_SIZE 64
+#define SHADOW_OFFSET CRAM_SIZE
+#define HIGHLIGHT_OFFSET (SHADOW_OFFSET+CRAM_SIZE)
+#define MODE4_OFFSET (HIGHLIGHT_OFFSET+CRAM_SIZE)
 #define VSRAM_SIZE 40
 #define VRAM_SIZE (64*1024)
 #define BORDER_LEFT 13
@@ -271,5 +274,7 @@ void vdp_deserialize(deserialize_buffer *buf, void *vcontext);
 void vdp_force_update_framebuffer(vdp_context *context);
 void vdp_toggle_debug_view(vdp_context *context, uint8_t debug_type);
 void vdp_inc_debug_mode(vdp_context *context);
+//to be implemented by the host system
+uint16_t read_dma_value(uint32_t address);
 
 #endif //VDP_H_
