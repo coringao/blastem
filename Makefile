@@ -39,7 +39,11 @@ LIBS=sdl2 glew
 FONT:=nuklear_ui/font_mac.o
 else
 ifdef USE_GLES
+ifdef GLES_LIB
+LIBS=sdl2
+else
 LIBS=sdl2 glesv2
+endif
 CFLAGS+= -DUSE_GLES
 else
 LIBS=sdl2 glew gl
@@ -87,7 +91,7 @@ ifeq ($(MAKECMDGOALS),libblastem.so)
 LDFLAGS:=-lm
 else
 CFLAGS:=$(shell pkg-config --cflags-only-I $(LIBS)) $(CFLAGS)
-LDFLAGS:=-lm $(shell pkg-config --libs $(LIBS))
+LDFLAGS:=-lm $(shell pkg-config --libs $(LIBS)) $(GLES_LIB)
 endif #libblastem.so
 
 ifeq ($(OS),Darwin)

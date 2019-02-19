@@ -188,8 +188,10 @@ static void deserialize(system_header *sys, uint8_t *data, size_t size)
 	deserialize_buffer buffer;
 	init_deserialize(&buffer, data, size);
 	genesis_deserialize(&buffer, gen);
+#ifdef USE_NATIVE
 	//HACK: Fix this once PC/IR is represented in a better way in 68K core
 	gen->m68k->resume_pc = get_native_address_trans(gen->m68k, gen->m68k->last_prefetch_address);
+#endif
 }
 
 uint16_t read_dma_value(uint32_t address)

@@ -482,7 +482,9 @@ static void request_exit(system_header *system)
 {
 	sms_context *sms = (sms_context *)system;
 	sms->should_return = 1;
+#ifdef USE_NATIVE
 	sms->z80->target_cycle = sms->z80->sync_cycle = sms->z80->current_cycle;
+#endif
 }
 
 static void inc_debug_mode(system_header *system)
