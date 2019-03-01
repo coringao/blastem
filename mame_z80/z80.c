@@ -423,11 +423,14 @@ static inline uint8_t in(z80_device *z80, uint16_t port)
 {
 	memmap_chunk const *map_tmp = z80->options->gen.memmap;
 	uint32_t chunks_tmp = z80->options->gen.memmap_chunks;
+	uint32_t mask_tmp = z80->options->gen.address_mask;
 	z80->options->gen.memmap = z80->options->iomap;
 	z80->options->gen.memmap_chunks = z80->options->io_chunks;
+	z80->options->gen.address_mask = z80->options->io_address_mask;
 	uint8_t value = read_byte(port, (void **)z80->mem_pointers, &z80->options->gen, z80);
 	z80->options->gen.memmap = map_tmp;
 	z80->options->gen.memmap_chunks = chunks_tmp;
+	z80->options->gen.address_mask = mask_tmp;
 	return value;
 }
 
@@ -3549,7 +3552,9 @@ void z80_run(z80_context *z80, uint32_t target_cycle)
 		if (z80->m_icount <= int_icount && z80->m_iff1 && !z80->m_after_ei) {
 			take_interrupt(z80);
 			z80->current_cycle = target_cycle - z80->m_icount * z80->options->gen.clock_divider;
-			z80->next_int_pulse(z80);
+			if (z80->next_int_pulse) {
+				z80->next_int_pulse(z80);
+			}
 			if (z80->int_pulse_start < target_cycle) {
 				int_icount = (z80->int_pulse_start < z80->current_cycle) ? z80->m_icount
 					: ((z80->int_pulse_start - z80->current_cycle) + z80->options->gen.clock_divider - 1) / z80->options->gen.clock_divider;
@@ -3560,6 +3565,8 @@ void z80_run(z80_context *z80, uint32_t target_cycle)
 		z80->m_after_ldair = 0;
 
 		PRVPC = PCD;
+		/*printf("Z80: %X - A: %X, B: %X, C: %X D: %X, E: %X, H: %X, L: %X, SP: %X, IX: %X, IY: %X @ %d\n",
+			PCD, A, B, C, D, E, H, L, SPD, IXD, IYD, target_cycle - z80->m_icount * z80->options->gen.clock_divider);*/
 		//debugger_instruction_hook(this, PCD);
 		z80->m_r++;
 		EXEC(op,rop(z80));
