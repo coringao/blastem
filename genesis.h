@@ -9,10 +9,14 @@
 #include <stdint.h>
 #include "system.h"
 #include "m68k_core.h"
+#ifdef NEW_CORE
+#include "z80.h"
+#else
 #ifdef USE_NATIVE
 #include "z80_to_x86.h"
 #else
 #include "mame_z80/z80.h"
+#endif
 #endif
 #include "ym2612.h"
 #include "vdp.h"
@@ -52,6 +56,7 @@ struct genesis_context {
 	uint32_t        int_latency_prev2;
 	uint32_t        reset_cycle;
 	uint8_t         bank_regs[8];
+	uint16_t        z80_bank_reg;
 	uint16_t        mapper_start_index;
 	uint8_t         mapper_type;
 	uint8_t         save_type;

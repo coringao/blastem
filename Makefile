@@ -121,7 +121,8 @@ CFLAGS+= -DZ80_LOG_ADDRESS
 endif
 
 ifdef PROFILE
-LDFLAGS+= -Wl,--no-as-needed -lprofiler -Wl,--as-needed
+PROFFLAGS:= -Wl,--no-as-needed -lprofiler -Wl,--as-needed
+CFLAGS+= -g3
 endif
 ifdef NOGL
 CFLAGS+= -DDISABLE_OPENGL
@@ -164,8 +165,13 @@ ifeq ($(CPU),i686)
 endif
 endif
 
+ifdef NEW_CORE
+Z80OBJS=z80.o z80inst.o 
+CFLAGS+= -DNEW_CORE
+else
 #Z80OBJS=z80inst.o z80_to_x86.o
 Z80OBJS=z80inst.o mame_z80/z80.o
+endif
 AUDIOOBJS=ym2612.o psg.o wave.o
 CONFIGOBJS=config.o tern.o util.o paths.o 
 NUKLEAROBJS=$(FONT) nuklear_ui/blastem_nuklear.o nuklear_ui/sfnt.o controller_info.o
@@ -238,7 +244,7 @@ libblastem.so : $(LIBOBJS)
 	$(CC) -shared -o $@ $^ $(LDFLAGS)
 
 blastem$(EXE) : $(MAINOBJS)
-	$(CC) -o $@ $^ $(LDFLAGS)
+	$(CC) -o $@ $^ $(LDFLAGS) $(PROFFLAGS)
 	$(FIXUP) ./$@
 	
 blastjag$(EXE) : jaguar.o jag_video.o $(RENDEROBJS) serialize.o $(M68KOBJS) $(TRANSOBJS) $(CONFIGOBJS)
@@ -263,7 +269,7 @@ transz80 : transz80.o $(Z80OBJS) $(TRANSOBJS)
 	$(CC) -o transz80 transz80.o $(Z80OBJS) $(TRANSOBJS)
 
 ztestrun : ztestrun.o serialize.o $(Z80OBJS) $(TRANSOBJS)
-	$(CC) -o ztestrun ztestrun.o $(Z80OBJS) $(TRANSOBJS) $(OPT)
+	$(CC) -o ztestrun $^ $(OPT)
 
 ztestgen : ztestgen.o z80inst.o
 	$(CC) -ggdb -o ztestgen ztestgen.o z80inst.o
@@ -277,7 +283,7 @@ vgmplay$(EXE) : vgmplay.o $(RENDEROBJS) serialize.o $(CONFIGOBJS) $(AUDIOOBJS)
 	$(FIXUP) ./$@
 
 blastcpm : blastcpm.o util.o serialize.o $(Z80OBJS) $(TRANSOBJS)
-	$(CC) -o $@ $^ $(OPT)
+	$(CC) -o $@ $^ $(OPT) $(PROFFLAGS)
 
 test : test.o vdp.o
 	$(CC) -o test test.o vdp.o
@@ -302,6 +308,9 @@ offsets : offsets.c z80_to_x86.h m68k_core.h
 
 vos_prog_info : vos_prog_info.o vos_program_module.o
 	$(CC) -o vos_prog_info vos_prog_info.o vos_program_module.o
+	
+%.c : %.cpu cpu_dsl.py
+	./cpu_dsl.py -d goto $< > $@
 
 %.o : %.S
 	$(CC) -c -o $@ $<

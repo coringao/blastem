@@ -20,6 +20,14 @@ class Block:
 			self.addOp(NormalOp(parts))
 		return self
 		
+	def processOps(self, prog, fieldVals, output, otype, oplist):
+		for i in range(0, len(oplist)):
+			if i + 1 < len(oplist) and oplist[i+1].op == 'update_flags':
+				flagUpdates, _ = prog.flags.parseFlagUpdate(oplist[i+1].params[0])
+			else:
+				flagUpdates = None
+			oplist[i].generate(prog, self, fieldVals, output, otype, flagUpdates)
+		
 	def resolveLocal(self, name):
 		return None
 			
@@ -47,7 +55,7 @@ class Instruction(Block):
 	def addOp(self, op):
 		if op.op == 'local':
 			name = op.params[0]
-			size = op.params[1]
+			size = int(op.params[1])
 			self.locals[name] = size
 		elif op.op == 'invalid':
 			name = op.params[0]
@@ -121,9 +129,14 @@ class Instruction(Block):
 			output.append('\n\tuint{sz}_t {name};'.format(sz=self.locals[var], name=var))
 		self.newLocals = []
 		fieldVals,_ = self.getFieldVals(value)
-		for op in self.implementation:
-			op.generate(prog, self, fieldVals, output, otype)
-		begin = '\nvoid ' + self.generateName(value) + '(' + prog.context_type + ' *context)\n{'
+		self.processOps(prog, fieldVals, output, otype, self.implementation)
+		
+		if prog.dispatch == 'call':
+			begin = '\nvoid ' + self.generateName(value) + '(' + prog.context_type + ' *context)\n{'
+		elif prog.dispatch == 'goto':
+			begin = '\n' + self.generateName(value) + ': {'
+		else:
+			raise Exception('Unsupported dispatch type ' + prog.dispatch)
 		if prog.needFlagCoalesce:
 			begin += prog.flags.coalesceFlags(prog, otype)
 		if prog.needFlagDisperse:
@@ -131,6 +144,8 @@ class Instruction(Block):
 		for var in self.newLocals:
 			begin += '\n\tuint{sz}_t {name};'.format(sz=self.locals[var], name=var)
 		prog.popScope()
+		if prog.dispatch == 'goto':
+			output += prog.nextInstruction(otype)
 		return begin + ''.join(output) + '\n}'
 		
 	def __str__(self):
@@ -150,16 +165,17 @@ class SubRoutine(Block):
 		self.arg_map = {}
 		self.locals = {}
 		self.regValues = {}
+		self.argValues = {}
 	
 	def addOp(self, op):
 		if op.op == 'arg':
 			name = op.params[0]
-			size = op.params[1]
+			size = int(op.params[1])
 			self.arg_map[name] = len(self.args)
 			self.args.append((name, size))
 		elif op.op == 'local':
 			name = op.params[0]
-			size = op.params[1]
+			size = int(op.params[1])
 			self.locals[name] = size
 		else:
 			self.implementation.append(op)
@@ -173,7 +189,12 @@ class SubRoutine(Block):
 		self.locals[name] = size
 	
 	def localSize(self, name):
-		return self.locals.get(name)
+		if name in self.locals:
+			return self.locals[name]
+		if name in self.arg_map:
+			argIndex = self.arg_map[name]
+			return self.args[argIndex][1]
+		return None
 			
 	def inline(self, prog, params, output, otype, parent):
 		if len(params) != len(self.args):
@@ -189,8 +210,8 @@ class SubRoutine(Block):
 		for name in self.locals:
 			size = self.locals[name]
 			output.append('\n\tuint{size}_t {sub}_{local};'.format(size=size, sub=self.name, local=name))
-		for op in self.implementation:
-			op.generate(prog, self, argValues, output, otype)
+		self.argValues = argValues
+		self.processOps(prog, argValues, output, otype, self.implementation)
 		prog.popScope()
 		
 	def __str__(self):
@@ -209,23 +230,66 @@ class Op:
 		self.impls = {}
 		self.outOp = ()
 	def cBinaryOperator(self, op):
-		def _impl(prog, params):
+		def _impl(prog, params, rawParams, flagUpdates):
 			if op == '-':
 				a = params[1]
 				b = params[0]
 			else:
 				a = params[0]
 				b = params[1]
-			return '\n\t{dst} = {a} {op} {b};'.format(
-				dst = params[2], a = a, b = b, op = op
+			needsCarry = needsOflow = needsHalf = False
+			if flagUpdates:
+				for flag in flagUpdates:
+					calc = prog.flags.flagCalc[flag]
+					if calc == 'carry':
+						needsCarry = True
+					elif calc == 'half-carry':
+						needsHalf = True
+					elif calc == 'overflow':
+						needsOflow = True
+			decl = ''
+			if needsCarry or needsOflow or needsHalf:
+				size = prog.paramSize(rawParams[2])
+				if needsCarry and op != 'lsr':
+					size *= 2
+				decl,name = prog.getTemp(size)
+				dst = prog.carryFlowDst = name
+				prog.lastA = a
+				prog.lastB = b
+				prog.lastBFlow = b if op == '-' else '(~{b})'.format(b=b)
+			else:
+				dst = params[2]
+			return decl + '\n\t{dst} = {a} {op} {b};'.format(
+				dst = dst, a = a, b = b, op = op
 			)
 		self.impls['c'] = _impl
 		self.outOp = (2,)
 		return self
 	def cUnaryOperator(self, op):
-		def _impl(prog, params):
-			return '\n\t{dst} = {op}{a};'.format(
-				dst = params[1], a = params[0], op = op
+		def _impl(prog, params, rawParams, flagUpdates):
+			dst = params[1]
+			decl = ''
+			if op == '-':
+				if flagUpdates:
+					for flag in flagUpdates:
+						calc = prog.flags.flagCalc[flag]
+						if calc == 'carry':
+							needsCarry = True
+						elif calc == 'half-carry':
+							needsHalf = True
+						elif calc == 'overflow':
+							needsOflow = True
+				if needsCarry or needsOflow or needsHalf:
+					size = prog.paramSize(rawParams[1])
+					if needsCarry:
+						size *= 2
+					decl,name = prog.getTemp(size)
+					dst = prog.carryFlowDst = name
+					prog.lastA = 0
+					prog.lastB = params[0]
+					prog.lastBFlow = params[0]
+			return decl + '\n\t{dst} = {op}{a};'.format(
+				dst = dst, a = params[0], op = op
 			)
 		self.impls['c'] = _impl
 		self.outOp = (1,)
@@ -244,11 +308,21 @@ class Op:
 		return not self.evalFun is None
 	def numArgs(self):
 		return self.evalFun.__code__.co_argcount
-	def generate(self, otype, prog, params, rawParams):
+	def numParams(self):
+		if self.outOp:
+			params = max(self.outOp) + 1
+		else:
+			params = 0
+		if self.evalFun:
+			params = max(params, self.numArgs())
+		return params
+	def generate(self, otype, prog, params, rawParams, flagUpdates):
 		if self.impls[otype].__code__.co_argcount == 2:
 			return self.impls[otype](prog, params)
-		else:
+		elif self.impls[otype].__code__.co_argcount == 3:
 			return self.impls[otype](prog, params, rawParams)
+		else:
+			return self.impls[otype](prog, params, rawParams, flagUpdates)
 		
 		
 def _xchgCImpl(prog, params, rawParams):
@@ -261,50 +335,54 @@ def _dispatchCImpl(prog, params):
 		table = 'main'
 	else:
 		table = params[1]
-	return '\n\timpl_{tbl}[{op}](context);'.format(tbl = table, op = params[0])
+	if prog.dispatch == 'call':
+		return '\n\timpl_{tbl}[{op}](context);'.format(tbl = table, op = params[0])
+	elif prog.dispatch == 'goto':
+		return '\n\tgoto *impl_{tbl}[{op}];'.format(tbl = table, op = params[0])
+	else:
+		raise Exception('Unsupported dispatch type ' + prog.dispatch)
 
 def _updateFlagsCImpl(prog, params, rawParams):
-	i = 0
-	last = ''
-	autoUpdate = set()
-	explicit = {}
-	for c in params[0]:
-		if c.isdigit():
-			if last.isalpha():
-				num = int(c)
-				if num > 1:
-					raise Exception(c + ' is not a valid digit for update_flags')
-				explicit[last] = num
-				last = c
-			else:
-				raise Exception('Digit must follow flag letter in update_flags')
-		else:
-			if last.isalpha():
-				autoUpdate.add(last)
-			last = c
-	if last.isalpha():
-		autoUpdate.add(last)
+	autoUpdate, explicit = prog.flags.parseFlagUpdate(params[0])
 	output = []
-	#TODO: handle autoUpdate flags
+	parity = None
+	directFlags = {}
 	for flag in autoUpdate:
 		calc = prog.flags.flagCalc[flag]
 		calc,_,resultBit = calc.partition('-')
-		lastDst = prog.resolveParam(prog.lastDst, None, {})
+		if prog.carryFlowDst:
+			lastDst = prog.carryFlowDst
+		else:
+			lastDst = prog.resolveParam(prog.lastDst, prog.currentScope, {})
 		storage = prog.flags.getStorage(flag)
-		if calc == 'bit' or calc == 'sign':
+		if calc == 'bit' or calc == 'sign' or calc == 'carry' or calc == 'half' or calc == 'overflow':
+			myRes = lastDst
 			if calc == 'sign':
 				resultBit = prog.paramSize(prog.lastDst) - 1
+			elif calc == 'carry':
+				if prog.lastOp.op in ('asr', 'lsr'):
+					resultBit = 0
+					myRes = prog.lastA
+				else:
+					resultBit = prog.paramSize(prog.lastDst)
+					if prog.lastOp.op == 'ror':
+						resultBit -= 1
+			elif calc == 'half':
+				resultBit = prog.paramSize(prog.lastDst) - 4
+				myRes = '({a} ^ {b} ^ {res})'.format(a = prog.lastA, b = prog.lastB, res = lastDst)
+			elif calc == 'overflow':
+				resultBit = prog.paramSize(prog.lastDst) - 1
+				myRes = '((({a} ^ {b})) & ({a} ^ {res}))'.format(a = prog.lastA, b = prog.lastBFlow, res = lastDst)
 			else:
-				resultBit = int(resultBit)
+				#Note: offsetting this by the operation size - 8 makes sense for the Z80
+				#but might not for other CPUs with this kind of fixed bit flag behavior
+				resultBit = int(resultBit) + prog.paramSize(prog.lastDst) - 8
 			if type(storage) is tuple:
 				reg,storageBit = storage
-				reg = prog.resolveParam(reg, None, {})
 				if storageBit == resultBit:
-					#TODO: optimize this case
-					output.append('\n\t{reg} = ({reg} & ~{mask}U) | ({res} & {mask}U);'.format(
-						reg = reg, mask = 1 << resultBit, res = lastDst
-					))
+					directFlags.setdefault((reg, myRes), []).append(resultBit)
 				else:
+					reg = prog.resolveParam(reg, None, {})
 					if resultBit > storageBit:
 						op = '>>'
 						shift = resultBit - storageBit
@@ -312,34 +390,77 @@ def _updateFlagsCImpl(prog, params, rawParams):
 						op = '<<'
 						shift = storageBit - resultBit
 					output.append('\n\t{reg} = ({reg} & ~{mask}U) | ({res} {op} {shift}U & {mask}U);'.format(
-						reg = reg, mask = 1 << storageBit, res = lastDst, op = op, shift = shift
+						reg = reg, mask = 1 << storageBit, res = myRes, op = op, shift = shift
 					))
 			else:
 				reg = prog.resolveParam(storage, None, {})
-				output.append('\n\t{reg} = {res} & {mask}U;'.format(reg=reg, res=lastDst, mask = 1 << resultBit))
+				maxBit = prog.paramSize(storage) - 1
+				if resultBit > maxBit:
+					output.append('\n\t{reg} = {res} >> {shift} & {mask}U;'.format(reg=reg, res=myRes, shift = resultBit - maxBit, mask = 1 << maxBit))
+				else:
+					output.append('\n\t{reg} = {res} & {mask}U;'.format(reg=reg, res=myRes, mask = 1 << resultBit))
 		elif calc == 'zero':
+			if prog.carryFlowDst:
+				realSize = prog.paramSize(prog.lastDst)
+				if realSize != prog.paramSize(prog.carryFlowDst):
+					lastDst = '({res} & {mask})'.format(res=lastDst, mask = (1 << realSize) - 1)
 			if type(storage) is tuple:
 				reg,storageBit = storage
 				reg = prog.resolveParam(reg, None, {})
 				output.append('\n\t{reg} = {res} ? ({reg} & {mask}U) : ({reg} | {bit}U);'.format(
 					reg = reg, mask = ~(1 << storageBit), res = lastDst, bit = 1 << storageBit
 				))
-			elif prog.paramSize(prog.lastDst) > prog.paramSize(storage):
-				reg = prog.resolveParam(storage, None, {})
-				output.append('\n\t{reg} = {res} != 0;'.format(
-					reg = reg, res = lastDst
-				))
 			else:
 				reg = prog.resolveParam(storage, None, {})
-				output.append('\n\t{reg} = {res};'.format(reg = reg, res = lastDst))
-		elif calc == 'half-carry':
-			pass
-		elif calc == 'carry':
-			pass
-		elif calc == 'overflow':
-			pass
+				output.append('\n\t{reg} = {res} == 0;'.format(
+					reg = reg, res = lastDst
+				))
 		elif calc == 'parity':
-			pass
+			parity = storage
+			paritySize = prog.paramSize(prog.lastDst)
+			if prog.carryFlowDst:
+				parityDst = paritySrc = prog.carryFlowDst
+			else:
+				paritySrc = lastDst
+				decl,name = prog.getTemp(paritySize)
+				output.append(decl)
+				parityDst = name
+		else:
+			raise Exception('Unknown flag calc type: ' + calc)
+	for reg, myRes in directFlags:
+		bits = directFlags[(reg, myRes)]
+		resolved = prog.resolveParam(reg, None, {})
+		if len(bits) == len(prog.flags.storageToFlags[reg]):
+			output.append('\n\t{reg} = {res};'.format(reg = resolved, res = myRes))
+		else:
+			mask = 0
+			for bit in bits:
+				mask |= 1 << bit
+			output.append('\n\t{reg} = ({reg} & ~{mask}U) | ({res} & {mask}U);'.format(
+				reg = resolved, mask = mask, res = myRes
+			))
+	if prog.carryFlowDst:
+		if prog.lastOp.op != 'cmp':
+			output.append('\n\t{dst} = {tmpdst};'.format(dst = prog.resolveParam(prog.lastDst, prog.currentScope, {}), tmpdst = prog.carryFlowDst))
+		prog.carryFlowDst = None
+	if parity:
+		if paritySize > 8:
+			if paritySize > 16:
+				output.append('\n\t{dst} = {src} ^ ({src} >> 16);'.format(dst=parityDst, src=paritySrc))
+				paritySrc = parityDst
+			output.append('\n\t{dst} = {src} ^ ({src} >> 8);'.format(dst=parityDst, src=paritySrc))
+			paritySrc = parityDst
+		output.append('\n\t{dst} = ({src} ^ ({src} >> 4)) & 0xF;'.format(dst=parityDst, src=paritySrc))
+		if type(parity) is tuple:
+			reg,bit = parity
+			reg = prog.resolveParam(reg, None, {})
+			output.append('\n\t{flag} = ({flag} & ~{mask}U) | ((0x6996 >> {parity}) << {bit} & {mask}U);'.format(
+				flag=reg, mask = 1 << bit, bit = bit, parity = parityDst
+			))
+		else:
+			reg = prog.resolveParam(parity, None, {})
+			output.append('\n\t{flag} = 0x9669 >> {parity} & 1;'.format(flag=reg, parity=parityDst))
+			
 	#TODO: combine explicit flags targeting the same storage location
 	for flag in explicit:
 		location = prog.flags.getStorage(flag)
@@ -358,31 +479,213 @@ def _updateFlagsCImpl(prog, params, rawParams):
 			output.append('\n\t{reg} = {val};'.format(reg=reg, val=explicit[flag]))
 	return ''.join(output)
 	
-def _cmpCImpl(prog, params):
-	size = prog.paramSize(params[1])
+def _cmpCImpl(prog, params, rawParams, flagUpdates):
+	size = prog.paramSize(rawParams[1])
+	needsCarry = False
+	if flagUpdates:
+		for flag in flagUpdates:
+			calc = prog.flags.flagCalc[flag]
+			if calc == 'carry':
+				needsCarry = True
+				break
+	if needsCarry:
+		size *= 2
 	tmpvar = 'cmp_tmp{sz}__'.format(sz=size)
-	typename = ''
+	if flagUpdates:
+		prog.carryFlowDst = tmpvar
+		prog.lastA = params[1]
+		prog.lastB = params[0]
+		prog.lastBFlow = params[0]
 	scope = prog.getRootScope()
 	if not scope.resolveLocal(tmpvar):
 		scope.addLocal(tmpvar, size)
-	prog.lastDst = tmpvar
+	prog.lastDst = rawParams[1]
 	return '\n\t{var} = {b} - {a};'.format(var = tmpvar, a = params[0], b = params[1])
 
-def _asrCImpl(prog, params, rawParams):
-	shiftSize = prog.paramSize(rawParams[0])
-	mask = 1 << (shiftSize - 1)
-	return '\n\t{dst} = ({a} >> {b}) | ({a} & {mask});'.format(a = params[0], b = params[1], dst = params[2], mask = mask)
-		
+def _asrCImpl(prog, params, rawParams, flagUpdates):
+	needsCarry = False
+	if flagUpdates:
+		for flag in flagUpdates:
+			calc = prog.flags.flagCalc[flag]
+			if calc == 'carry':
+				needsCarry = True
+	decl = ''
+	size = prog.paramSize(rawParams[2])
+	if needsCarry:
+		decl,name = prog.getTemp(size * 2)
+		dst = prog.carryFlowDst = name
+		prog.lastA = params[0]
+	else:
+		dst = params[2]
+	mask = 1 << (size - 1)
+	return decl + '\n\t{dst} = ({a} >> {b}) | ({a} & {mask} ? 0xFFFFFFFFU << ({size} - {b}) : 0);'.format(
+		a = params[0], b = params[1], dst = dst, mask = mask, size=size)
+	
+def _sext(size, src):
+	if size == 16:
+		return src | 0xFF00 if src & 0x80 else src
+	else:
+		return src | 0xFFFF0000 if src & 0x8000 else src
+
+def _sextCImpl(prog, params, rawParms):
+	if params[0] == 16:
+		fmt = '\n\t{dst} = {src} & 0x80 ? {src} | 0xFF00 : {src};'
+	else:
+		fmt = '\n\t{dst} = {src} & 0x8000 ? {src} | 0xFFFF0000 : {src};'
+	return fmt.format(src=params[1], dst=params[2])
+	
+def _getCarryCheck(prog):
+	carryFlag = None
+	for flag in prog.flags.flagCalc:
+		if prog.flags.flagCalc[flag] == 'carry':
+			carryFlag = flag
+	if carryFlag is None:
+		raise Exception('adc requires a defined carry flag')
+	carryStorage = prog.flags.getStorage(carryFlag)
+	if type(carryStorage) is tuple:
+		reg,bit = carryStorage
+		reg = prog.resolveReg(reg, None, (), False)
+		return '({reg} & 1 << {bit})'.format(reg=reg, bit=bit)
+	else:
+		return prog.resolveReg(carryStorage, None, (), False)
+
+def _adcCImpl(prog, params, rawParams, flagUpdates):
+	needsCarry = needsOflow = needsHalf = False
+	if flagUpdates:
+		for flag in flagUpdates:
+			calc = prog.flags.flagCalc[flag]
+			if calc == 'carry':
+				needsCarry = True
+			elif calc == 'half-carry':
+				needsHalf = True
+			elif calc == 'overflow':
+				needsOflow = True
+	decl = ''
+	carryCheck = _getCarryCheck(prog)
+	if needsCarry or needsOflow or needsHalf:
+		size = prog.paramSize(rawParams[2])
+		if needsCarry:
+			size *= 2
+		decl,name = prog.getTemp(size)
+		dst = prog.carryFlowDst = name
+		prog.lastA = params[0]
+		prog.lastB = params[1]
+		prog.lastBFlow = '(~{b})'.format(b=params[1])
+	else:
+		dst = params[2]
+	return decl + '\n\t{dst} = {a} + {b} + ({check} ? 1 : 0);'.format(dst = dst,
+		a = params[0], b = params[1], check = carryCheck
+	)
+
+def _sbcCImpl(prog, params, rawParams, flagUpdates):
+	needsCarry = needsOflow = needsHalf = False
+	if flagUpdates:
+		for flag in flagUpdates:
+			calc = prog.flags.flagCalc[flag]
+			if calc == 'carry':
+				needsCarry = True
+			elif calc == 'half-carry':
+				needsHalf = True
+			elif calc == 'overflow':
+				needsOflow = True
+	decl = ''
+	carryCheck = _getCarryCheck(prog)
+	if needsCarry or needsOflow or needsHalf:
+		size = prog.paramSize(rawParams[2])
+		if needsCarry:
+			size *= 2
+		decl,name = prog.getTemp(size)
+		dst = prog.carryFlowDst = name
+		prog.lastA = params[1]
+		prog.lastB = params[0]
+		prog.lastBFlow = params[0]
+	else:
+		dst = params[2]
+	return decl + '\n\t{dst} = {b} - {a} - ({check} ? 1 : 0);'.format(dst = dst,
+		a = params[0], b = params[1], check=_getCarryCheck(prog)
+	)
+	
+def _rolCImpl(prog, params, rawParams, flagUpdates):
+	needsCarry = False
+	if flagUpdates:
+		for flag in flagUpdates:
+			calc = prog.flags.flagCalc[flag]
+			if calc == 'carry':
+				needsCarry = True
+	decl = ''
+	size = prog.paramSize(rawParams[2])
+	if needsCarry:
+		decl,name = prog.getTemp(size * 2)
+		dst = prog.carryFlowDst = name
+	else:
+		dst = params[2]
+	return decl + '\n\t{dst} = {a} << {b} | {a} >> ({size} - {b});'.format(dst = dst,
+		a = params[0], b = params[1], size=size
+	)
+	
+def _rlcCImpl(prog, params, rawParams, flagUpdates):
+	needsCarry = False
+	if flagUpdates:
+		for flag in flagUpdates:
+			calc = prog.flags.flagCalc[flag]
+			if calc == 'carry':
+				needsCarry = True
+	decl = ''
+	carryCheck = _getCarryCheck(prog)
+	size = prog.paramSize(rawParams[2])
+	if needsCarry:
+		decl,name = prog.getTemp(size * 2)
+		dst = prog.carryFlowDst = name
+	else:
+		dst = params[2]
+	return decl + '\n\t{dst} = {a} << {b} | {a} >> ({size} + 1 - {b}) | ({check} ? 1 : 0) << ({b} - 1);'.format(dst = dst,
+		a = params[0], b = params[1], size=size, check=carryCheck
+	)
+	
+def _rorCImpl(prog, params, rawParams, flagUpdates):
+	size = prog.paramSize(rawParams[2])
+	return '\n\t{dst} = {a} >> {b} | {a} << ({size} - {b});'.format(dst = params[2],
+		a = params[0], b = params[1], size=size
+	)
+
+def _rrcCImpl(prog, params, rawParams, flagUpdates):
+	needsCarry = False
+	if flagUpdates:
+		for flag in flagUpdates:
+			calc = prog.flags.flagCalc[flag]
+			if calc == 'carry':
+				needsCarry = True
+	decl = ''
+	carryCheck = _getCarryCheck(prog)
+	size = prog.paramSize(rawParams[2])
+	if needsCarry:
+		decl,name = prog.getTemp(size * 2)
+		dst = prog.carryFlowDst = name
+	else:
+		dst = params[2]
+	return decl + '\n\t{dst} = {a} >> {b} | {a} << ({size} + 1 - {b}) | ({check} ? 1 : 0) << ({size}-{b});'.format(dst = dst,
+		a = params[0], b = params[1], size=size, check=carryCheck
+	)
+	
+def _updateSyncCImpl(prog, params):
+	return '\n\t{sync}(context, target_cycle);'.format(sync=prog.sync_cycle)
+
 _opMap = {
 	'mov': Op(lambda val: val).cUnaryOperator(''),
 	'not': Op(lambda val: ~val).cUnaryOperator('~'),
 	'lnot': Op(lambda val: 0 if val else 1).cUnaryOperator('!'),
 	'neg': Op(lambda val: -val).cUnaryOperator('-'),
 	'add': Op(lambda a, b: a + b).cBinaryOperator('+'),
+	'adc': Op().addImplementation('c', 2, _adcCImpl),
 	'sub': Op(lambda a, b: b - a).cBinaryOperator('-'),
+	'sbc': Op().addImplementation('c', 2, _sbcCImpl),
 	'lsl': Op(lambda a, b: a << b).cBinaryOperator('<<'),
 	'lsr': Op(lambda a, b: a >> b).cBinaryOperator('>>'),
 	'asr': Op(lambda a, b: a >> b).addImplementation('c', 2, _asrCImpl),
+	'rol': Op().addImplementation('c', 2, _rolCImpl),
+	'rlc': Op().addImplementation('c', 2, _rlcCImpl),
+	'ror': Op().addImplementation('c', 2, _rorCImpl),
+	'rrc': Op().addImplementation('c', 2, _rrcCImpl),
 	'and': Op(lambda a, b: a & b).cBinaryOperator('&'),
 	'or':  Op(lambda a, b: a | b).cBinaryOperator('|'),
 	'xor': Op(lambda a, b: a ^ b).cBinaryOperator('^'),
@@ -390,6 +693,7 @@ _opMap = {
 		'c', 1, lambda prog, params: '\n\t{dst} = abs({src});'.format(dst=params[1], src=params[0])
 	),
 	'cmp': Op().addImplementation('c', None, _cmpCImpl),
+	'sext': Op(_sext).addImplementation('c', 2, _sextCImpl),
 	'ocall': Op().addImplementation('c', None, lambda prog, params: '\n\t{pre}{fun}({args});'.format(
 		pre = prog.prefix, fun = params[0], args = ', '.join(['context'] + [str(p) for p in params[1:]])
 	)),
@@ -410,7 +714,8 @@ _opMap = {
 	)),
 	'xchg': Op().addImplementation('c', (0,1), _xchgCImpl),
 	'dispatch': Op().addImplementation('c', None, _dispatchCImpl),
-	'update_flags': Op().addImplementation('c', None, _updateFlagsCImpl)
+	'update_flags': Op().addImplementation('c', None, _updateFlagsCImpl),
+	'update_sync': Op().addImplementation('c', None, _updateSyncCImpl)
 }
 
 #represents a simple DSL instruction
@@ -419,13 +724,17 @@ class NormalOp:
 		self.op = parts[0]
 		self.params = parts[1:]
 		
-	def generate(self, prog, parent, fieldVals, output, otype):
+	def generate(self, prog, parent, fieldVals, output, otype, flagUpdates):
 		procParams = []
-		allParamsConst = True
+		allParamsConst = flagUpdates is None and not prog.conditional
 		opDef = _opMap.get(self.op)
 		for param in self.params:
 			allowConst = (self.op in prog.subroutines or len(procParams) != len(self.params) - 1) and param in parent.regValues
 			isDst = (not opDef is None) and len(procParams) in opDef.outOp
+			if isDst and self.op == 'xchg':
+				#xchg uses its regs as both source and destination
+				#we need to resolve as both so that disperse/coalesce flag stuff gets done
+				prog.resolveParam(param, parent, fieldVals, allowConst, False)
 			param = prog.resolveParam(param, parent, fieldVals, allowConst, isDst)
 			
 			if (not type(param) is int) and len(procParams) != len(self.params) - 1:
@@ -448,6 +757,8 @@ class NormalOp:
 			#TODO: Disassembler
 			pass
 		elif not opDef is None:
+			if opDef.numParams() > len(procParams):
+				raise Exception('Insufficient params for ' + self.op + ' (' + ', '.join(self.params) + ')')
 			if opDef.canEval() and allParamsConst:
 				#do constant folding
 				if opDef.numArgs() >= len(procParams):
@@ -461,10 +772,29 @@ class NormalOp:
 					dst = maybeLocal
 				parent.regValues[dst] = result
 				if prog.isReg(dst):
-					output.append(_opMap['mov'].generate(otype, prog, procParams, self.params))
+					shortProc = (procParams[0], procParams[-1])
+					shortParams = (self.params[0], self.params[-1])
+					output.append(_opMap['mov'].generate(otype, prog, shortProc, shortParams, None))
 			else:
-				output.append(opDef.generate(otype, prog, procParams, self.params))
+				output.append(opDef.generate(otype, prog, procParams, self.params, flagUpdates))
+				for dstIdx in opDef.outOp:
+					dst = self.params[dstIdx]
+					while dst in prog.meta:
+						dst = prog.meta[dst]
+					if dst in parent.regValues:
+						del parent.regValues[dst]
+					
 		elif self.op in prog.subroutines:
+			procParams = []
+			for param in self.params:
+				begin,sep,end = param.partition('.')
+				if sep:
+					if end in fieldVals:
+						param = begin + '.' + str(fieldVals[end])
+				else:
+					if param in fieldVals:
+						param = fieldVals[param]
+				procParams.append(param)
 			prog.subroutines[self.op].inline(prog, procParams, output, otype, parent)
 		else:
 			output.append('\n\t' + self.op + '(' + ', '.join([str(p) for p in procParams]) + ');')
@@ -517,7 +847,7 @@ class Switch(ChildBlock):
 			return self.current_locals[name]
 		return self.parent.localSize(name)
 			
-	def generate(self, prog, parent, fieldVals, output, otype):
+	def generate(self, prog, parent, fieldVals, output, otype, flagUpdates):
 		prog.pushScope(self)
 		param = prog.resolveParam(self.param, parent, fieldVals)
 		if type(param) is int:
@@ -527,39 +857,42 @@ class Switch(ChildBlock):
 				output.append('\n\t{')
 				for local in self.case_locals[param]:
 					output.append('\n\tuint{0}_t {1};'.format(self.case_locals[param][local], local))
-				for op in self.cases[param]:
-					op.generate(prog, self, fieldVals, output, otype)
+				self.processOps(prog, fieldVals, output, otype, self.cases[param])
 				output.append('\n\t}')
 			elif self.default:
 				self.current_locals = self.default_locals
 				output.append('\n\t{')
 				for local in self.default_locals:
 					output.append('\n\tuint{0}_t {1};'.format(self.default[local], local))
-				for op in self.default:
-					op.generate(prog, self, fieldVals, output, otype)
+				self.processOps(prog, fieldVals, output, otype, self.default)
 				output.append('\n\t}')
 		else:
+			oldCond = prog.conditional
+			prog.conditional = True
 			output.append('\n\tswitch(' + param + ')')
 			output.append('\n\t{')
 			for case in self.cases:
+				temp = prog.temp.copy()
 				self.current_locals = self.case_locals[case]
 				self.regValues = dict(self.parent.regValues)
 				output.append('\n\tcase {0}U: '.format(case) + '{')
 				for local in self.case_locals[case]:
 					output.append('\n\tuint{0}_t {1};'.format(self.case_locals[case][local], local))
-				for op in self.cases[case]:
-					op.generate(prog, self, fieldVals, output, otype)
+				self.processOps(prog, fieldVals, output, otype, self.cases[case])
 				output.append('\n\tbreak;')
 				output.append('\n\t}')
+				prog.temp = temp
 			if self.default:
+				temp = prog.temp.copy()
 				self.current_locals = self.default_locals
 				self.regValues = dict(self.parent.regValues)
 				output.append('\n\tdefault: {')
 				for local in self.default_locals:
 					output.append('\n\tuint{0}_t {1};'.format(self.default_locals[local], local))
-				for op in self.default:
-					op.generate(prog, self, fieldVals, output, otype)
+				self.processOps(prog, fieldVals, output, otype, self.default)
+				prog.temp = temp
 			output.append('\n\t}')
+			prog.conditional = oldCond
 		prog.popScope()
 	
 	def __str__(self):
@@ -579,11 +912,19 @@ def _geuCImpl(prog, parent, fieldVals, output):
 		params = [prog.resolveParam(p, parent, fieldVals) for p in prog.lastOp.params]
 		return '\n\tif ({a} >= {b}) '.format(a=params[1], b = params[0]) + '{'
 	else:
-		raise ion(">=U not implemented in the general case yet")
+		raise Exception(">=U not implemented in the general case yet")
+
+def _eqCImpl(prog, parent, fieldVals, output):
+	return '\n\tif (!{a}) {'.format(a=prog.resolveParam(prog.lastDst, None, {}))
+
+def _neqCImpl(prog, parent, fieldVals, output):
+	return '\n\tif ({a}) {'.format(a=prog.resolveParam(prog.lastDst, None, {}))
 	
 _ifCmpImpl = {
 	'c': {
-		'>=U': _geuCImpl
+		'>=U': _geuCImpl,
+		'=': _eqCImpl,
+		'!=': _neqCImpl
 	}
 }
 #represents a DSL conditional construct
@@ -606,7 +947,7 @@ class If(ChildBlock):
 		if op.op == 'local':
 			name = op.params[0]
 			size = op.params[1]
-			self.locals[name] = size
+			self.curLocals[name] = size
 		elif op.op == 'else':
 			self.curLocals = self.elseLocals
 			self.curBody = self.elseBody
@@ -617,23 +958,25 @@ class If(ChildBlock):
 		return self.curLocals.get(name)
 		
 	def resolveLocal(self, name):
-		if name in self.locals:
+		if name in self.curLocals:
 			return name
 		return self.parent.resolveLocal(name)
 		
 	def _genTrueBody(self, prog, fieldVals, output, otype):
 		self.curLocals = self.locals
+		subOut = []
+		self.processOps(prog, fieldVals, subOut, otype, self.body)
 		for local in self.locals:
 			output.append('\n\tuint{sz}_t {nm};'.format(sz=self.locals[local], nm=local))
-		for op in self.body:
-			op.generate(prog, self, fieldVals, output, otype)
+		output += subOut
 			
 	def _genFalseBody(self, prog, fieldVals, output, otype):
 		self.curLocals = self.elseLocals
+		subOut = []
+		self.processOps(prog, fieldVals, subOut, otype, self.elseBody)
 		for local in self.elseLocals:
 			output.append('\n\tuint{sz}_t {nm};'.format(sz=self.elseLocals[local], nm=local))
-		for op in self.elseBody:
-			op.generate(prog, self, fieldVals, output, otype)
+		output += subOut
 	
 	def _genConstParam(self, param, prog, fieldVals, output, otype):
 		if param:
@@ -641,29 +984,43 @@ class If(ChildBlock):
 		else:
 			self._genFalseBody(prog, fieldVals, output, otype)
 			
-	def generate(self, prog, parent, fieldVals, output, otype):
+	def generate(self, prog, parent, fieldVals, output, otype, flagUpdates):
 		self.regValues = parent.regValues
 		try:
 			self._genConstParam(prog.checkBool(self.cond), prog, fieldVals, output, otype)
 		except Exception:
 			if self.cond in _ifCmpImpl[otype]:
+				oldCond = prog.conditional
+				prog.conditional = True
+				temp = prog.temp.copy()
 				output.append(_ifCmpImpl[otype][self.cond](prog, parent, fieldVals, output))
 				self._genTrueBody(prog, fieldVals, output, otype)
+				prog.temp = temp
 				if self.elseBody:
+					temp = prog.temp.copy()
 					output.append('\n\t} else {')
 					self._genFalseBody(prog, fieldVals, output, otype)
+					prog.temp = temp
 				output.append('\n\t}')
+				prog.conditional = oldCond
 			else:
 				cond = prog.resolveParam(self.cond, parent, fieldVals)
 				if type(cond) is int:
 					self._genConstParam(cond, prog, fieldVals, output, otype)
 				else:
+					temp = prog.temp.copy()
 					output.append('\n\tif ({cond}) '.format(cond=cond) + '{')
+					oldCond = prog.conditional
+					prog.conditional = True
 					self._genTrueBody(prog, fieldVals, output, otype)
+					prog.temp = temp
 					if self.elseBody:
+						temp = prog.temp.copy()
 						output.append('\n\t} else {')
 						self._genFalseBody(prog, fieldVals, output, otype)
+						prog.temp = temp
 					output.append('\n\t}')
+					prog.conditional = oldCond
 						
 	
 	def __str__(self):
@@ -679,12 +1036,14 @@ class Registers:
 		self.pointers = {}
 		self.regArrays = {}
 		self.regToArray = {}
+		self.addReg('cycles', 32)
+		self.addReg('sync_cycle', 32)
 	
 	def addReg(self, name, size):
 		self.regs[name] = size
 		
-	def addPointer(self, name, size):
-		self.pointers[name] = size
+	def addPointer(self, name, size, count):
+		self.pointers[name] = (size, count)
 	
 	def addRegArray(self, name, size, regs):
 		self.regArrays[name] = (size, regs)
@@ -721,12 +1080,15 @@ class Registers:
 	
 	def processLine(self, parts):
 		if len(parts) == 3:
-			self.addRegArray(parts[0], int(parts[1]), int(parts[2]))
+			if parts[1].startswith('ptr'):
+				self.addPointer(parts[0], parts[1][3:], int(parts[2]))
+			else:
+				self.addRegArray(parts[0], int(parts[1]), int(parts[2]))
 		elif len(parts) > 2:
 			self.addRegArray(parts[0], int(parts[1]), parts[2:])
 		else:
 			if parts[1].startswith('ptr'):
-				self.addPointer(parts[0], int(parts[1][3:]))
+				self.addPointer(parts[0], parts[1][3:], 1)
 			else:
 				self.addReg(parts[0], int(parts[1]))
 		return self
@@ -734,7 +1096,18 @@ class Registers:
 	def writeHeader(self, otype, hFile):
 		fieldList = []
 		for pointer in self.pointers:
-			hFile.write('\n\tuint{sz}_t *{nm};'.format(nm=pointer, sz=self.pointers[pointer]))
+			stars = '*'
+			ptype, count = self.pointers[pointer]
+			while ptype.startswith('ptr'):
+				stars += '*'
+				ptype = ptype[3:]
+			if ptype.isdigit():
+				ptype = 'uint{sz}_t'.format(sz=ptype)
+			if count > 1:
+				arr = '[{n}]'.format(n=count)
+			else:
+				arr = ''
+			hFile.write('\n\t{ptype} {stars}{nm}{arr};'.format(nm=pointer, ptype=ptype, stars=stars, arr=arr))
 		for reg in self.regs:
 			if not self.isRegArrayMember(reg):
 				fieldList.append((self.regs[reg], 1, reg))
@@ -757,6 +1130,7 @@ class Flags:
 		self.flagCalc = {}
 		self.flagStorage = {}
 		self.flagReg = None
+		self.storageToFlags = {}
 		self.maxBit = -1
 	
 	def processLine(self, parts):
@@ -777,6 +1151,8 @@ class Flags:
 				self.flagBits[flag] = bit
 			self.flagCalc[flag] = calc
 			self.flagStorage[flag] = storage
+			storage,_,storebit = storage.partition('.')
+			self.storageToFlags.setdefault(storage, []).append((storebit, flag))
 		return self
 	
 	def getStorage(self, flag):
@@ -787,6 +1163,28 @@ class Flags:
 			return (loc, int(bit))
 		else:
 			return loc 
+	
+	def parseFlagUpdate(self, flagString):
+		last = ''
+		autoUpdate = set()
+		explicit = {}
+		for c in flagString:
+			if c.isdigit():
+				if last.isalpha():
+					num = int(c)
+					if num > 1:
+						raise Exception(c + ' is not a valid digit for update_flags')
+					explicit[last] = num
+					last = c
+				else:
+					raise Exception('Digit must follow flag letter in update_flags')
+			else:
+				if last.isalpha():
+					autoUpdate.add(last)
+				last = c
+		if last.isalpha():
+			autoUpdate.add(last)
+		return (autoUpdate, explicit)
 	
 	def disperseFlags(self, prog, otype):
 		bitToFlag = [None] * (self.maxBit+1)
@@ -884,7 +1282,7 @@ class Flags:
 						src=src, dst=dst, srcbit=srcbit, dstbit=dstbit
 					))
 			if direct:
-				output.append('\n\t{dst} |= {src} & {mask}'.format(
+				output.append('\n\t{dst} |= {src} & {mask};'.format(
 					dst=dst, src=src, mask=direct
 				))
 		return ''.join(output)
@@ -902,12 +1300,20 @@ class Program:
 		self.extra_tables = info.get('extra_tables', [])
 		self.context_type = self.prefix + 'context'
 		self.body = info.get('body', [None])[0]
+		self.interrupt = info.get('interrupt', [None])[0]
+		self.sync_cycle = info.get('sync_cycle', [None])[0]
 		self.includes = info.get('include', [])
 		self.flags = flags
 		self.lastDst = None
 		self.scopes = []
 		self.currentScope = None
 		self.lastOp = None
+		self.carryFlowDst = None
+		self.lastA = None
+		self.lastB = None
+		self.lastBFlow = None
+		self.conditional = False
+		self.declares = []
 		
 	def __str__(self):
 		pieces = []
@@ -930,21 +1336,21 @@ class Program:
 		hFile.write('\n}} {0}options;'.format(self.prefix))
 		hFile.write('\n\ntypedef struct {')
 		hFile.write('\n\t{0}options *opts;'.format(self.prefix))
-		hFile.write('\n\tuint32_t cycles;')
 		self.regs.writeHeader(otype, hFile)
 		hFile.write('\n}} {0}context;'.format(self.prefix))
 		hFile.write('\n')
+		hFile.write('\nvoid {pre}execute({type} *context, uint32_t target_cycle);'.format(pre = self.prefix, type = self.context_type))
+		for decl in self.declares:
+			hFile.write('\n' + decl)
 		hFile.write('\n#endif //{0}_'.format(macro))
 		hFile.write('\n')
 		hFile.close()
-	def build(self, otype):
-		body = []
+		
+	def _buildTable(self, otype, table, body, lateBody):
 		pieces = []
-		for include in self.includes:
-			body.append('#include "{0}"\n'.format(include))
-		for table in self.instructions:
-			opmap = [None] * (1 << self.opsize)
-			bodymap = {}
+		opmap = [None] * (1 << self.opsize)
+		bodymap = {}
+		if table in self.instructions:
 			instructions = self.instructions[table]
 			instructions.sort()
 			for inst in instructions:
@@ -957,8 +1363,8 @@ class Program:
 						self.lastOp = None
 						opmap[val] = inst.generateName(val)
 						bodymap[val] = inst.generateBody(val, self, otype)
-			
-			pieces.append('\ntypedef void (*impl_fun)({pre}context *context);'.format(pre=self.prefix))
+		
+		if self.dispatch == 'call':
 			pieces.append('\nstatic impl_fun impl_{name}[{sz}] = {{'.format(name = table, sz=len(opmap)))
 			for inst in range(0, len(opmap)):
 				op = opmap[inst]
@@ -968,20 +1374,76 @@ class Program:
 					pieces.append('\n\t' + op + ',')
 					body.append(bodymap[inst])
 			pieces.append('\n};')
-		if self.body in self.subroutines:
+		elif self.dispatch == 'goto':
+			body.append('\n\tstatic void *impl_{name}[{sz}] = {{'.format(name = table, sz=len(opmap)))
+			for inst in range(0, len(opmap)):
+				op = opmap[inst]
+				if op is None:
+					body.append('\n\t\t&&unimplemented,')
+				else:
+					body.append('\n\t\t&&' + op + ',')
+					lateBody.append(bodymap[inst])
+			body.append('\n\t};')
+		else:
+			raise Exception("unimplmeneted dispatch type " + self.dispatch)
+		body.extend(pieces)
+		
+	def nextInstruction(self, otype):
+		output = []
+		if self.dispatch == 'goto':
+			if self.interrupt in self.subroutines:
+				output.append('\n\tif (context->cycles >= context->sync_cycle) {')
+			output.append('\n\tif (context->cycles >= target_cycle) { return; }')
+			if self.interrupt in self.subroutines:
+				self.meta = {}
+				self.temp = {}
+				self.subroutines[self.interrupt].inline(self, [], output, otype, None)
+				output.append('\n\t}')
+			
+			self.meta = {}
+			self.temp = {}
+			self.subroutines[self.body].inline(self, [], output, otype, None)
+		return output
+	
+	def build(self, otype):
+		body = []
+		pieces = []
+		for include in self.includes:
+			body.append('#include "{0}"\n'.format(include))
+		if self.dispatch == 'call':
+			body.append('\nstatic void unimplemented({pre}context *context)'.format(pre = self.prefix))
+			body.append('\n{')
+			body.append('\n\tfatal_error("Unimplemented instruction\\n");')
+			body.append('\n}\n')
+			body.append('\ntypedef void (*impl_fun)({pre}context *context);'.format(pre=self.prefix))
+			for table in self.extra_tables:
+				body.append('\nstatic impl_fun impl_{name}[{sz}];'.format(name = table, sz=(1 << self.opsize)))
+			body.append('\nstatic impl_fun impl_main[{sz}];'.format(sz=(1 << self.opsize)))
+		elif self.dispatch == 'goto':
+			body.append('\nvoid {pre}execute({type} *context, uint32_t target_cycle)'.format(pre = self.prefix, type = self.context_type))
+			body.append('\n{')
+			
+		for table in self.extra_tables:
+			self._buildTable(otype, table, body, pieces)
+		self._buildTable(otype, 'main', body, pieces)
+		if self.dispatch == 'call' and self.body in self.subroutines:
 			pieces.append('\nvoid {pre}execute({type} *context, uint32_t target_cycle)'.format(pre = self.prefix, type = self.context_type))
 			pieces.append('\n{')
+			pieces.append('\n\t{sync}(context, target_cycle);'.format(sync=self.sync_cycle))
 			pieces.append('\n\twhile (context->cycles < target_cycle)')
 			pieces.append('\n\t{')
+			#TODO: Handle interrupts in call dispatch mode
 			self.meta = {}
 			self.temp = {}
 			self.subroutines[self.body].inline(self, [], pieces, otype, None)
 			pieces.append('\n\t}')
 			pieces.append('\n}')
-		body.append('\nstatic void unimplemented({pre}context *context)'.format(pre = self.prefix))
-		body.append('\n{')
-		body.append('\n\tfatal_error("Unimplemented instruction");')
-		body.append('\n}\n')
+		elif self.dispatch == 'goto':
+			body.append('\n\t{sync}(context, target_cycle);'.format(sync=self.sync_cycle))
+			body += self.nextInstruction(otype)
+			pieces.append('\nunimplemented:')
+			pieces.append('\n\tfatal_error("Unimplemented instruction\\n");')
+			pieces.append('\n}')
 		return ''.join(body) +  ''.join(pieces)
 		
 	def checkBool(self, name):
@@ -992,8 +1454,8 @@ class Program:
 	def getTemp(self, size):
 		if size in self.temp:
 			return ('', self.temp[size])
-		self.temp[size] = 'tmp{sz}'.format(sz=size);
-		return ('\n\tuint{sz}_t tmp{sz};'.format(sz=size), self.temp[size])
+		self.temp[size] = 'gen_tmp{sz}__'.format(sz=size);
+		return ('\n\tuint{sz}_t gen_tmp{sz}__;'.format(sz=size), self.temp[size])
 		
 	def resolveParam(self, param, parent, fieldVals, allowConstant=True, isdst=False):
 		keepGoing = True
@@ -1013,14 +1475,20 @@ class Program:
 						return parent.regValues[param]
 					maybeLocal = parent.resolveLocal(param)
 					if maybeLocal:
+						if isdst:
+							self.lastDst = param
 						return maybeLocal
 				if param in fieldVals:
 					param = fieldVals[param]
+					fieldVals = {}
+					keepGoing = True
 				elif param in self.meta:
 					param = self.meta[param]
 					keepGoing = True
 				elif self.isReg(param):
-					param = self.resolveReg(param, parent, fieldVals, isdst)
+					return self.resolveReg(param, parent, fieldVals, isdst)
+		if isdst:
+			self.lastDst = param
 		return param
 	
 	def isReg(self, name):
@@ -1070,9 +1538,12 @@ class Program:
 	
 	
 	def paramSize(self, name):
-		size = self.currentScope.localSize(name)
-		if size:
-			return size
+		if name in self.meta:
+			return self.paramSize(self.meta[name])
+		for i in range(len(self.scopes) -1, -1, -1):
+			size = self.scopes[i].localSize(name)
+			if size:
+				return size
 		begin,sep,_ = name.partition('.')
 		if sep and self.regs.isRegArray(begin):
 			return self.regs.regArrays[begin][0]
@@ -1092,11 +1563,13 @@ class Program:
 	def getRootScope(self):
 		return self.scopes[0]
 
-def parse(f):
+def parse(args):
+	f = args.source
 	instructions = {}
 	subroutines = {}
 	registers = None
 	flags = None
+	declares = []
 	errors = []
 	info = {}
 	line_num = 0
@@ -1108,9 +1581,22 @@ def parse(f):
 			continue
 		if line[0].isspace():
 			if not cur_object is None:
-				parts = [el.strip() for el in line.split(' ')]
+				sep = True
+				parts = []
+				while sep:
+					before,sep,after = line.partition('"')
+					before = before.strip()
+					if before:
+						parts += [el.strip() for el in before.split(' ')]
+					if sep:
+						#TODO: deal with escaped quotes
+						inside,sep,after = after.partition('"')
+						parts.append('"' + inside + '"')
+					line = after
 				if type(cur_object) is dict:
 					cur_object[parts[0]] = parts[1:]
+				elif type(cur_object) is list:
+					cur_object.append(' '.join(parts))
 				else:
 					cur_object = cur_object.processLine(parts)
 				
@@ -1168,6 +1654,8 @@ def parse(f):
 				if flags is None:
 					flags = Flags()
 				cur_object = flags
+			elif line.strip() == 'declare':
+				cur_object = declares
 			else:
 				cur_object = SubRoutine(line.strip())
 				subroutines[cur_object.name] = cur_object
@@ -1175,8 +1663,19 @@ def parse(f):
 		print(errors)
 	else:
 		p = Program(registers, instructions, subroutines, info, flags)
+		p.dispatch = args.dispatch
+		p.declares = declares
 		p.booleans['dynarec'] = False
 		p.booleans['interp'] = True
+		if args.define:
+			for define in args.define:
+				name,sep,val = define.partition('=')
+				name = name.strip()
+				val = val.strip()
+				if sep:
+					p.booleans[name] = bool(val)
+				else:
+					p.booleans[name] = True
 		
 		if 'header' in info:
 			print('#include "{0}"'.format(info['header'][0]))
@@ -1186,8 +1685,12 @@ def parse(f):
 		print(p.build('c'))
 
 def main(argv):
-	f =  open(argv[1])
-	parse(f)
+	from argparse import ArgumentParser, FileType
+	argParser = ArgumentParser(description='CPU emulator DSL compiler')
+	argParser.add_argument('source', type=FileType('r'))
+	argParser.add_argument('-D', '--define', action='append')
+	argParser.add_argument('-d', '--dispatch', choices=('call', 'switch', 'goto'), default='call')
+	parse(argParser.parse_args(argv[1:]))
 
 if __name__ == '__main__':
 	from sys import argv
