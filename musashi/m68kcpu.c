@@ -686,7 +686,7 @@ void m68k_cpu_execute(m68000_base_device *this)
 
 			/* Record previous program counter */
 			REG_PPC(this) = REG_PC(this);
-			printf("M68K: %X @ %d\n", this->pc, this->c.current_cycle);
+			
 			
 				this->run_mode = RUN_MODE_NORMAL;
 				/* Read an instruction and call its handler */
