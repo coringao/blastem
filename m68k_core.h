@@ -118,12 +118,11 @@ void remove_breakpoint(m68k_context * context, uint32_t address);
 uint32_t get_instruction_start(m68k_options *opts, uint32_t address);
 uint16_t m68k_get_ir(m68k_context *context);
 void m68k_print_regs(m68k_context * context);
+void m68k_invalidate_code_range(m68k_context *context, uint32_t start, uint32_t end);
 #ifdef USE_NATIVE
 m68k_context * m68k_handle_code_write(uint32_t address, m68k_context * context);
-void m68k_invalidate_code_range(m68k_context *context, uint32_t start, uint32_t end);
 #else
 #define m68k_handle_code_write(A, M)
-#define m68k_invalidate_code_range(M, S, E)
 #endif
 void m68k_serialize(m68k_context *context, uint32_t pc, serialize_buffer *buf);
 void m68k_deserialize(deserialize_buffer *buf, void *vcontext);

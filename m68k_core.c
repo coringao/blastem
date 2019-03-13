@@ -1342,3 +1342,29 @@ void m68k_deserialize(deserialize_buffer *buf, void *vcontext)
 	context->int_pending = load_int8(buf);
 	context->trace_pending = load_int8(buf);
 }
+
+#ifndef USE_NATIVE
+void m68k_invalidate_code_range(m68k_context *context, uint32_t start, uint32_t end)
+{
+	m68000_base_device *device = (m68000_base_device *)context;
+	for(uint32_t address = start; address < end; address += 0x10000)
+	{
+		device->read_pointers[address >> 16] = NULL;
+		device->write_pointers[address >> 16] = NULL;
+		memmap_chunk const *chunk = find_map_chunk(address, &context->options->gen, 0, NULL);
+		if (!chunk || chunk->end < (address + 64*1024) || (chunk->flags & (MMAP_ONLY_ODD | MMAP_ONLY_EVEN)) || !chunk->buffer) {
+			continue;
+		}
+		void *ptr = get_native_pointer(address, (void **)context->mem_pointers, &context->options->gen);
+		if (!ptr) {
+			continue;
+		}
+		if (chunk->flags & MMAP_READ) {
+			device->read_pointers[address >> 16] = ptr;
+		}
+		if (chunk->flags & MMAP_WRITE) {
+			device->write_pointers[address >> 16] = ptr;
+		}
+	}
+}
+#endif
