@@ -686,7 +686,7 @@ void m68k_cpu_execute(m68000_base_device *this)
 
 			/* Record previous program counter */
 			REG_PPC(this) = REG_PC(this);
-
+			printf("M68K: %X @ %d\n", this->pc, this->c.current_cycle);
 			
 				this->run_mode = RUN_MODE_NORMAL;
 				/* Read an instruction and call its handler */
@@ -786,8 +786,8 @@ void m68ki_write_8(m68000_base_device *m68k, uint32_t address, uint8_t value)
 {
 	address &= 0xFFFFFF;
 	uint32_t base = address >> 16;
-	if (m68k->read_pointers[base]) {
-		uint8_t *chunk = m68k->read_pointers[base];
+	if (m68k->write_pointers[base]) {
+		uint8_t *chunk = m68k->write_pointers[base];
 		chunk[(address ^ 1) & 0xFFFF] = value;
 		return;
 	}
@@ -864,7 +864,7 @@ void m68k_init_cpu_m68000(m68000_base_device *this)
 		this->read_pointers[address >> 16] = NULL;
 		this->write_pointers[address >> 16] = NULL;
 		memmap_chunk const *chunk = find_map_chunk(address, &this->c.options->gen, 0, NULL);
-		if (!chunk || chunk->end < (address + 64*1024) || (chunk->flags & (MMAP_ONLY_ODD | MMAP_ONLY_EVEN | MMAP_PTR_IDX)) || !chunk->buffer) {
+		if (!chunk || chunk->end < (address + 64*1024) || (chunk->flags & (MMAP_ONLY_ODD | MMAP_ONLY_EVEN)) || !chunk->buffer) {
 			continue;
 		}
 		void *ptr = get_native_pointer(address, (void **)this->c.mem_pointers, &this->c.options->gen);
