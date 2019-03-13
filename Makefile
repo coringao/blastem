@@ -152,25 +152,24 @@ CPU:=i686
 endif
 endif
 
-#TRANSOBJS=gen.o backend.o $(MEM) arena.o tern.o
-TRANSOBJS=backend.o tern.o
-M68KOBJS=68kinst.o m68k_core.o musashi/m68kops.o musashi/m68kcpu.o
+ifdef USE_NATIVE
+TRANSOBJS=gen.o backend.o $(MEM) arena.o tern.o
+M68KOBJS=68kinst.o m68k_core.o
+Z80OBJS=z80inst.o z80_to_x86.o
 ifeq ($(CPU),x86_64)
-#M68KOBJS+= m68k_core_x86.o
-#TRANSOBJS+= gen_x86.o backend_x86.o
+M68KOBJS+= m68k_core_x86.o
+TRANSOBJS+= gen_x86.o backend_x86.o
 else
 ifeq ($(CPU),i686)
-#M68KOBJS+= m68k_core_x86.o
-#TRANSOBJS+= gen_x86.o backend_x86.o
+M68KOBJS+= m68k_core_x86.o
+TRANSOBJS+= gen_x86.o backend_x86.o
 endif
 endif
-
-ifdef NEW_CORE
-Z80OBJS=z80.o z80inst.o 
-CFLAGS+= -DNEW_CORE
+CFLAGS+= -DUSE_NATIVE
 else
-#Z80OBJS=z80inst.o z80_to_x86.o
-Z80OBJS=z80inst.o mame_z80/z80.o
+Z80OBJS=z80.o z80inst.o
+TRANSOBJS=backend.o tern.o
+M68KOBJS=68kinst.o m68k_core.o musashi/m68kops.o musashi/m68kcpu.o
 endif
 AUDIOOBJS=ym2612.o psg.o wave.o
 CONFIGOBJS=config.o tern.o util.o paths.o 

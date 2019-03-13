@@ -11,7 +11,7 @@
 #include "terminal.h"
 #include "z80inst.h"
 
-#ifdef NEW_CORE
+#ifndef USE_NATIVE
 #define Z80_OPTS opts
 #else
 #define Z80_OPTS options
@@ -197,7 +197,7 @@ void zdebugger_print(z80_context * context, char format_char, char * param)
 	}
 	switch (param[0])
 	{
-#ifndef NEW_CORE
+#ifdef USE_NATIVE
 	case 'a':
 		if (param[1] == 'f') {
 			if(param[2] == '\'') {
@@ -496,7 +496,7 @@ z80_context * zdebugger(z80_context * context, uint16_t address)
 					if (inst.addr_mode == Z80_IMMED) {
 						after = inst.immed;
 					} else if (inst.ea_reg == Z80_HL) {
-#ifndef NEW_CORE
+#ifdef USE_NATIVE
 						after = context->regs[Z80_H] << 8 | context->regs[Z80_L];
 					} else if (inst.ea_reg == Z80_IX) {
 						after = context->regs[Z80_IXH] << 8 | context->regs[Z80_IXL];

@@ -4,7 +4,7 @@
  BlastEm is free software distributed under the terms of the GNU General Public License version 3 or greater. See COPYING for full license text.
 */
 #include "z80inst.h"
-#ifdef NEW_CORE
+#ifndef USE_NATIVE
 #include "z80.h"
 #include <string.h>
 #else
@@ -47,7 +47,7 @@ const memmap_chunk port_map[] = {
 	{ 0x0000, 0x100, 0xFF, 0, 0, 0,                                  NULL,    NULL, NULL, z80_unmapped_read, z80_unmapped_write}
 };
 
-#ifndef NEW_CORE
+#ifdef USE_NATIVE
 void z80_next_int_pulse(z80_context * context)
 {
 	context->int_pulse_start = context->int_pulse_end = CYCLE_NEVER;
@@ -98,7 +98,7 @@ int main(int argc, char ** argv)
 	fclose(f);
 	init_z80_opts(&opts, z80_map, 2, port_map, 1, 1, 0xFF);
 	context = init_z80_context(&opts);
-#ifdef NEW_CORE
+#ifndef USE_NATIVE
 	z80_execute(context, 1000);
 	printf("A: %X\nB: %X\nC: %X\nD: %X\nE: %X\nHL: %X\nIX: %X\nIY: %X\nSP: %X\n\nIM: %d, IFF1: %d, IFF2: %d\n",
 		context->main[7], context->main[0], context->main[1],

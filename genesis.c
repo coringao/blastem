@@ -39,7 +39,7 @@ uint32_t MCLKS_PER_68K;
 #define MAX_SOUND_CYCLES 100000	
 #endif
 
-#ifdef NEW_CORE
+#ifndef USE_NATIVE
 #define Z80_CYCLE cycles
 #define Z80_OPTS opts
 #define z80_handle_code_write(...)
@@ -299,7 +299,7 @@ static void adjust_int_cycle(m68k_context * context, vdp_context * v_context)
 static void z80_next_int_pulse(z80_context * z_context)
 {
 	genesis_context * gen = z_context->system;
-#ifdef NEW_CORE
+#ifndef USE_NATIVE
 	z_context->int_cycle = vdp_next_vint_z80(gen->vdp);
 	z_context->int_end_cycle = z_context->int_cycle + Z80_INT_PULSE_MCLKS;
 	z_context->int_value = 0xFF;
@@ -315,7 +315,7 @@ static void sync_z80(z80_context * z_context, uint32_t mclks)
 {
 #ifndef NO_Z80
 	if (z80_enabled) {
-#ifdef NEW_CORE
+#ifndef USE_NATIVE
 		if (z_context->int_cycle == 0xFFFFFFFFU) {
 			z80_next_int_pulse(z_context);
 		}
@@ -429,20 +429,19 @@ m68k_context * sync_components(m68k_context * context, uint32_t address)
 	if (gen->reset_cycle < context->target_cycle) {
 		context->target_cycle = gen->reset_cycle;
 	}
-#ifdef USE_NATIVE
 	if (address) {
+#ifdef USE_NATIVE
 		if (gen->header.enter_debugger) {
 			gen->header.enter_debugger = 0;
 			debugger(context, address);
 		}
-#ifdef NEW_CORE
-		if (gen->header.save_state) {
-#else
 		if (gen->header.save_state && (z_context->pc || !z_context->native_pc || z_context->reset || !z_context->busreq)) {
+#else
+		if (gen->header.save_state) {
 #endif
 			uint8_t slot = gen->header.save_state - 1;
 			gen->header.save_state = 0;
-#ifndef NEW_CORE
+#ifdef USE_NATIVE
 			if (z_context->native_pc && !z_context->reset) {
 				//advance Z80 core to the start of an instruction
 				while (!z_context->pc)
@@ -452,7 +451,9 @@ m68k_context * sync_components(m68k_context * context, uint32_t address)
 			}
 #endif
 			char *save_path = slot == SERIALIZE_SLOT ? NULL : get_slot_name(&gen->header, slot, use_native_states ? "state" : "gst");
+#ifdef USE_NATIVE
 			if (use_native_states || slot == SERIALIZE_SLOT) {
+#endif
 				serialize_buffer state;
 				init_serialize(&state);
 				genesis_serialize(gen, &state, address);
@@ -465,16 +466,17 @@ m68k_context * sync_components(m68k_context * context, uint32_t address)
 					save_to_file(&state, save_path);
 					free(state.data);
 				}
+#ifdef USE_NATIVE
 			} else {
 				save_gst(gen, save_path, address);
 			}
+#endif
 			printf("Saved state to %s\n", save_path);
 			free(save_path);
 		} else if(gen->header.save_state) {
 			context->sync_cycle = context->current_cycle + 1;
 		}
 	}
-#endif
 #ifdef REFRESH_EMULATION
 	last_sync_cycle = context->current_cycle;
 #endif
@@ -999,19 +1001,11 @@ static uint8_t z80_read_bank(uint32_t location, void * vcontext)
 	genesis_context *gen = context->system;
 
 	if (gen->bus_busy) {
-#if defined(USE_NATIVE) || defined(NEW_CORE)
 		context->Z80_CYCLE = gen->m68k->current_cycle;
-#else
-		context->m_icount = 0;
-#endif
 	}
 
 	//typical delay from bus arbitration
-#if defined(USE_NATIVE) || defined(NEW_CORE)
 	context->Z80_CYCLE += 3 * MCLKS_PER_Z80;
-#else
-	context->m_icount -= 3;
-#endif
 	//TODO: add cycle for an access right after a previous one
 	//TODO: Below cycle time is an estimate based on the time between 68K !BG goes low and Z80 !MREQ goes high
 	//      Needs a new logic analyzer capture to get the actual delay on the 68K side
@@ -1035,18 +1029,10 @@ static void *z80_write_bank(uint32_t location, void * vcontext, uint8_t value)
 	z80_context * context = vcontext;
 	genesis_context *gen = context->system;
 	if (gen->bus_busy) {
-#if defined(USE_NATIVE) || defined(NEW_CORE)
 		context->Z80_CYCLE = gen->m68k->current_cycle;
-#else
-		context->m_icount = 0;
-#endif
 	}
 	//typical delay from bus arbitration
-#if defined(USE_NATIVE) || defined(NEW_CORE)
 	context->Z80_CYCLE += 3 * MCLKS_PER_Z80;
-#else
-	context->m_icount -= 3;
-#endif
 	//TODO: add cycle for an access right after a previous one
 	//TODO: Below cycle time is an estimate based on the time between 68K !BG goes low and Z80 !MREQ goes high
 	//      Needs a new logic analyzer capture to get the actual delay on the 68K side
@@ -1429,7 +1415,7 @@ genesis_context *alloc_init_genesis(rom_info *rom, void *main_rom, void *lock_on
 	z80_options *z_opts = malloc(sizeof(z80_options));
 	init_z80_opts(z_opts, z80_map, 5, NULL, 0, MCLKS_PER_Z80, 0xFFFF);
 	gen->z80 = init_z80_context(z_opts);
-#ifndef NEW_CORE
+#ifdef USE_NATIVE
 	gen->z80->next_int_pulse = z80_next_int_pulse;
 #endif
 	z80_assert_reset(gen->z80, 0);

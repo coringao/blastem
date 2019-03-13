@@ -9,7 +9,7 @@
 #include "saves.h"
 #include "bindings.h"
 
-#ifdef NEW_CORE
+#ifndef USE_NATIVE
 #define Z80_CYCLE cycles
 #define Z80_OPTS opts
 #define z80_handle_code_write(...)
@@ -70,7 +70,7 @@ static void update_interrupts(sms_context *sms)
 {
 	uint32_t vint = vdp_next_vint(sms->vdp);
 	uint32_t hint = vdp_next_hint(sms->vdp);
-#ifdef NEW_CORE
+#ifndef USE_NATIVE
 	sms->z80->int_cycle = vint < hint ? vint : hint;
 	z80_sync_cycle(sms->z80, sms->z80->sync_cycle);
 #else
@@ -357,7 +357,7 @@ static uint8_t load_state(system_header *system, uint8_t slot)
 	sms_context *sms = (sms_context *)system;
 	char *statepath = get_slot_name(system, slot, "state");
 	uint8_t ret;
-#if !defined(NEW_CORE) && defined(USE_NATIVE)
+#ifdef USE_NATIVE
 	if (!sms->z80->native_pc) {
 		ret = get_modification_time(statepath) != 0;
 		if (ret) {
@@ -391,11 +391,9 @@ static void run_sms(system_header *system)
 			system->enter_debugger = 0;
 			zdebugger(sms->z80, sms->z80->pc);
 		}
-#endif
-#ifdef NEW_CORE
-		if (sms->z80->nmi_cycle == CYCLE_NEVER) {
-#else
 		if (sms->z80->nmi_start == CYCLE_NEVER) {
+#else
+		if (sms->z80->nmi_cycle == CYCLE_NEVER) {
 #endif
 			uint32_t nmi = vdp_next_nmi(sms->vdp);
 			if (nmi != CYCLE_NEVER) {
@@ -476,7 +474,7 @@ static void soft_reset(system_header *system)
 {
 	sms_context *sms = (sms_context *)system;
 	z80_assert_reset(sms->z80, sms->z80->Z80_CYCLE);
-#if !defined(NEW_CORE) && defined(USE_NATIVE)
+#ifdef USE_NATIVE
 	sms->z80->target_cycle = sms->z80->sync_cycle = sms->z80->current_cycle;
 #endif
 }
@@ -501,9 +499,7 @@ static void request_exit(system_header *system)
 	sms_context *sms = (sms_context *)system;
 	sms->should_return = 1;
 #ifdef USE_NATIVE
-#ifndef NEW_CORE
 	sms->z80->target_cycle = sms->z80->sync_cycle = sms->z80->Z80_CYCLE;
-#endif
 #endif
 }
 

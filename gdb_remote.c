@@ -170,7 +170,7 @@ static void m68k_write_byte(m68k_context * context, uint32_t address, uint8_t va
 	if (address >= 0xA00000 && address < 0xA04000) {
 		gen->zram[address & 0x1FFF] = value;
 		genesis_context * gen = context->system;
-#if !defined(NO_Z80) && !defined(NEW_CORE)
+#if !defined(NO_Z80) && defined(USE_NATIVE)
 		z80_handle_code_write(address & 0x1FFF, gen->z80);
 #endif
 		return;

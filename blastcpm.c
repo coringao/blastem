@@ -5,14 +5,10 @@
 #include <time.h>
 #include <sys/select.h>
 
-#ifdef NEW_CORE
-#include "z80.h"
-#else
 #ifdef USE_NATIVE
 #include "z80_to_x86.h"
 #else
-#include "mame_z80/z80.h"
-#endif
+#include "z80.h"
 #endif
 #include "util.h"
 
@@ -23,7 +19,7 @@ uint8_t ram[64 * 1024];
 #define OS_RESET 0xE403
 int headless = 1;
 
-#ifndef NEW_CORE
+#ifdef USE_NATIVE
 void z80_next_int_pulse(z80_context * context)
 {
 	context->int_pulse_start = context->int_pulse_end = CYCLE_NEVER;
@@ -72,10 +68,10 @@ void *exit_write(uint32_t address, void *context, uint8_t value)
 {
 	time_t duration = time(NULL) - start;
 	z80_context *z80 = context;
-#ifdef NEW_CORE
-	total_cycles += z80->cycles;
-#else
+#ifdef USE_NATIVE
 	total_cycles += context->current_cycle;
+#else
+	total_cycles += z80->cycles;
 #endif
 	printf("Effective clock speed: %f MHz\n", ((double)total_cycles) / (1000000.0 * duration));
 	exit(0);
@@ -127,14 +123,13 @@ int main(int argc, char **argv)
 	start = time(NULL);
 	for(;;)
 	{
-#ifdef NEW_CORE
-		z80_execute(context, 1000000);
-		total_cycles += context->cycles;
-		context->cycles = 0;
-#else
 		z80_run(context, 1000000);
+#ifdef USE_NATIVE		
 		total_cycles += context->current_cycle;
 		context->current_cycle = 0;
+#else
+		total_cycles += context->cycles;
+		context->cycles = 0;
 #endif
 		
 	}
