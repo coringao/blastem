@@ -898,9 +898,17 @@ void m68ki_exception_interrupt(m68000_base_device *this, uint32_t int_level)
 	/* If we are halted, don't do anything */
 	if(this->stopped)
 		return;
+		
+	if (this->c.int_pending == 255) {
+		this->c.int_pending = int_level;
+		return;
+	} else {
+		int_level = this->c.int_pending;
+	}
 
 	/* Acknowledge the interrupt */
 	this->c.int_ack = int_level;
+	this->c.int_pending = 255;
 	
 	vector = M68K_INT_ACK_AUTOVECTOR;//int_ack_callback(*this, int_level);
 

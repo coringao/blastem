@@ -1287,6 +1287,7 @@ m68k_context * init_68k_context(m68k_options * opts, m68k_reset_handler reset_ha
 	
 #endif
 	context->int_cycle = CYCLE_NEVER;
+	context->int_pending = 255;
 	context->status = 0x27;
 	context->reset_handler = (code_ptr)reset_handler;
 	return context;
