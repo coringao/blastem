@@ -43,6 +43,7 @@ uint32_t MCLKS_PER_68K;
 #define Z80_CYCLE cycles
 #define Z80_OPTS opts
 #define z80_handle_code_write(...)
+#include "musashi/m68kcpu.h"
 #else
 #define Z80_CYCLE current_cycle
 #define Z80_OPTS options
@@ -219,7 +220,12 @@ uint16_t read_dma_value(uint32_t address)
 static uint16_t get_open_bus_value(system_header *system)
 {
 	genesis_context *genesis = (genesis_context *)system;
+#ifdef USE_NATIVE
 	return read_dma_value(genesis->m68k->last_prefetch_address/2);
+#else
+	m68000_base_device *device = (m68000_base_device *)genesis->m68k;
+	return read_dma_value(device->pref_addr/2);
+#endif
 }
 
 static void adjust_int_cycle(m68k_context * context, vdp_context * v_context)
@@ -1126,8 +1132,10 @@ static uint8_t load_state(system_header *system, uint8_t slot)
 	if (load_from_file(&state, statepath)) {
 		genesis_deserialize(&state, gen);
 		free(state.data);
+#ifdef USE_NATIVE
 		//HACK
 		pc = gen->m68k->last_prefetch_address;
+#endif
 		ret = 1;
 	} else {
 #ifdef USE_NATIVE
@@ -1183,8 +1191,10 @@ static void start_genesis(system_header *system, char *statefile)
 		if (load_from_file(&state, statefile)) {
 			genesis_deserialize(&state, gen);
 			free(state.data);
+#ifdef USE_NATIVE
 			//HACK
 			pc = gen->m68k->last_prefetch_address;
+#endif
 		} else {
 #ifdef USE_NATIVE
 			pc = load_gst(gen, statefile);
