@@ -1302,6 +1302,7 @@ void m68k_serialize(m68k_context *context, uint32_t pc, serialize_buffer *buf)
 	{
 		save_int32(buf, context->aregs[i]);
 	}
+#ifdef USE_NATIVE
 	save_int32(buf, pc);
 	uint16_t sr = context->status << 3;
 	for (int flag = 4; flag >= 0; flag--) {
@@ -1309,6 +1310,11 @@ void m68k_serialize(m68k_context *context, uint32_t pc, serialize_buffer *buf)
 		sr |= context->flags[flag] != 0;
 	}
 	save_int16(buf, sr);
+#else
+	m68000_base_device *device = (m68000_base_device *)context;
+	save_int32(buf, device->pc);
+	save_int16(buf, m68ki_get_sr(device));
+#endif
 	save_int32(buf, context->current_cycle);
 	save_int32(buf, context->int_cycle);
 	save_int8(buf, context->int_num);
@@ -1327,6 +1333,7 @@ void m68k_deserialize(deserialize_buffer *buf, void *vcontext)
 	{
 		context->aregs[i] = load_int32(buf);
 	}
+#ifdef USE_NATIVE
 	//hack until both PC and IR registers are represented properly
 	context->last_prefetch_address = load_int32(buf);
 	uint16_t sr = load_int16(buf);
@@ -1336,6 +1343,11 @@ void m68k_deserialize(deserialize_buffer *buf, void *vcontext)
 		context->flags[flag] = sr & 1;
 		sr >>= 1;
 	}
+#else
+	m68000_base_device *device = vcontext;
+	device->pc = load_int32(buf);
+	m68ki_set_sr_noint_nosp(device, load_int16(buf));
+#endif
 	context->current_cycle = load_int32(buf);
 	context->int_cycle = load_int32(buf);
 	context->int_num = load_int8(buf);
