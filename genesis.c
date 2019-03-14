@@ -348,7 +348,7 @@ static void sync_sound(genesis_context * gen, uint32_t target)
 static uint32_t last_frame_num;
 
 //My refresh emulation isn't currently good enough and causes more problems than it solves
-//#define REFRESH_EMULATION
+#define REFRESH_EMULATION
 #ifdef REFRESH_EMULATION
 #define REFRESH_INTERVAL 128
 #define REFRESH_DELAY 2
@@ -366,12 +366,14 @@ m68k_context * sync_components(m68k_context * context, uint32_t address)
 	vdp_context * v_context = gen->vdp;
 	z80_context * z_context = gen->z80;
 #ifdef REFRESH_EMULATION
-	//lame estimation of refresh cycle delay
-	refresh_counter += context->current_cycle - last_sync_cycle;
-	if (!gen->bus_busy) {
-		context->current_cycle += REFRESH_DELAY * MCLKS_PER_68K * (refresh_counter / (MCLKS_PER_68K * REFRESH_INTERVAL));
+	if (context->current_cycle != last_sync_cycle) {
+		//lame estimation of refresh cycle delay
+		refresh_counter += context->current_cycle - last_sync_cycle;
+		if (!gen->bus_busy) {
+			context->current_cycle += REFRESH_DELAY * MCLKS_PER_68K * (refresh_counter / (MCLKS_PER_68K * REFRESH_INTERVAL));
+		}
+		refresh_counter = refresh_counter % (MCLKS_PER_68K * REFRESH_INTERVAL);
 	}
-	refresh_counter = refresh_counter % (MCLKS_PER_68K * REFRESH_INTERVAL);
 #endif
 
 	uint32_t mclks = context->current_cycle;
@@ -492,10 +494,12 @@ static m68k_context * vdp_port_write(uint32_t vdp_port, m68k_context * context, 
 	//printf("vdp_port write: %X, value: %X, cycle: %d\n", vdp_port, value, context->current_cycle);
 #ifdef REFRESH_EMULATION
 	//do refresh check here so we can avoid adding a penalty for a refresh that happens during a VDP access
-	refresh_counter += context->current_cycle - 4*MCLKS_PER_68K - last_sync_cycle;
-	context->current_cycle += REFRESH_DELAY * MCLKS_PER_68K * (refresh_counter / (MCLKS_PER_68K * REFRESH_INTERVAL));
-	refresh_counter = refresh_counter % (MCLKS_PER_68K * REFRESH_INTERVAL);
-	last_sync_cycle = context->current_cycle;
+	if (context->current_cycle - 4*MCLKS_PER_68K > last_sync_cycle) {
+		refresh_counter += context->current_cycle - 4*MCLKS_PER_68K - last_sync_cycle;
+		context->current_cycle += REFRESH_DELAY * MCLKS_PER_68K * (refresh_counter / (MCLKS_PER_68K * REFRESH_INTERVAL));
+		refresh_counter = refresh_counter % (MCLKS_PER_68K * REFRESH_INTERVAL);
+		last_sync_cycle = context->current_cycle;
+	}
 #endif
 	sync_components(context, 0);
 	genesis_context * gen = context->system;
@@ -630,11 +634,13 @@ static uint16_t vdp_port_read(uint32_t vdp_port, m68k_context * context)
 	vdp_port &= 0x1F;
 	uint16_t value;
 #ifdef REFRESH_EMULATION
-	//do refresh check here so we can avoid adding a penalty for a refresh that happens during a VDP access
-	refresh_counter += context->current_cycle - 4*MCLKS_PER_68K - last_sync_cycle;
-	context->current_cycle += REFRESH_DELAY * MCLKS_PER_68K * (refresh_counter / (MCLKS_PER_68K * REFRESH_INTERVAL));
-	refresh_counter = refresh_counter % (MCLKS_PER_68K * REFRESH_INTERVAL);
-	last_sync_cycle = context->current_cycle;
+	if (context->current_cycle - 4*MCLKS_PER_68K > last_sync_cycle) {
+		//do refresh check here so we can avoid adding a penalty for a refresh that happens during a VDP access
+		refresh_counter += context->current_cycle - 4*MCLKS_PER_68K - last_sync_cycle;
+		context->current_cycle += REFRESH_DELAY * MCLKS_PER_68K * (refresh_counter / (MCLKS_PER_68K * REFRESH_INTERVAL));
+		refresh_counter = refresh_counter % (MCLKS_PER_68K * REFRESH_INTERVAL);
+		last_sync_cycle = context->current_cycle;
+	}
 #endif
 	sync_components(context, 0);
 	genesis_context *gen = context->system;
