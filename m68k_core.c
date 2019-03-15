@@ -1274,9 +1274,7 @@ void init_m68k_opts(m68k_options * opts, memmap_chunk * memmap, uint32_t num_chu
 m68k_context * init_68k_context(m68k_options * opts, m68k_reset_handler reset_handler)
 {
 #ifdef USE_NATIVE
-	size_t ctx_size = sizeof(m68k_context) + ram_size(&opts->gen) / (1 << opts->gen.ram_flags_shift) / 8;
-	m68k_context * context = malloc(ctx_size);
-	memset(context, 0, ctx_size);
+	m68k_context * context = calloc(1, sizeof(m68k_context) + ram_size(&opts->gen) / (1 << opts->gen.ram_flags_shift) / 8);
 	context->options = opts;
 #else
 	m68000_base_device *device = malloc(sizeof(m68000_base_device));;
