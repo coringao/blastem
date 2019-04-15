@@ -61,6 +61,7 @@ struct audio_source {
 	double   dt;
 	uint64_t buffer_fraction;
 	uint64_t buffer_inc;
+	float    gain_mult;
 	uint32_t buffer_pos;
 	uint32_t read_start;
 	uint32_t read_end;
@@ -78,78 +79,72 @@ static uint8_t num_audio_sources;
 static uint8_t num_inactive_audio_sources;
 static uint8_t sync_to_audio;
 static uint32_t min_buffered;
+static float overall_gain_mult, *mix_buf;
+static int sample_size;
 
-typedef int32_t (*mix_func)(audio_source *audio, void *vstream, int len);
+typedef void (*conv_func)(float *samples, void *vstream, int sample_count);
 
-static int32_t mix_s16(audio_source *audio, void *vstream, int len)
+static void convert_null(float *samples, void *vstream, int sample_count)
 {
-	int samples = len/(sizeof(int16_t)*2);
+	memset(vstream, 0, sample_count * sample_size);
+}
+
+static void convert_s16(float *samples, void *vstream, int sample_count)
+{
 	int16_t *stream = vstream;
-	int16_t *end = stream + output_channels*samples;
-	int16_t *src = audio->front;
-	uint32_t i = audio->read_start;
-	uint32_t i_end = audio->read_end;
-	int16_t *cur = stream;
-	size_t first_add = output_channels > 1 ? 1 : 0, second_add = output_channels > 1 ? output_channels - 1 : 1;
-	if (audio->num_channels == 1) {
-		while (cur < end && i != i_end)
-		{
-			*cur += src[i];
-			cur += first_add;
-			*cur += src[i++];
-			cur += second_add;
-			i &= audio->mask;
+	for (int16_t *end = stream + sample_count; stream < end; stream++, samples++)
+	{
+		float sample = *samples;
+		int16_t out_sample;
+		if (sample >= 1.0f) {
+			out_sample = 0x7FFF;
+		} else if (sample <= -1.0f) {
+			out_sample = -0x8000;
+		} else {
+			out_sample = sample * 0x7FFF;
 		}
-	} else {
-		while (cur < end && i != i_end)
-		{
-			*cur += src[i++];
-			cur += first_add;
-			*cur += src[i++];
-			cur += second_add;
-			i &= audio->mask;
-		}
-	}
-	
-	if (cur != end) {
-		printf("Underflow of %d samples, read_start: %d, read_end: %d, mask: %X\n", (int)(end-cur)/2, audio->read_start, audio->read_end, audio->mask);
-	}
-	if (!sync_to_audio) {
-		audio->read_start = i;
-	}
-	if (cur != end) {
-		//printf("Underflow of %d samples, read_start: %d, read_end: %d, mask: %X\n", (int)(end-cur)/2, audio->read_start, audio->read_end, audio->mask);
-		return (cur-end)/2;
-	} else {
-		return ((i_end - i) & audio->mask) / audio->num_channels;
+		*stream = out_sample;
 	}
 }
 
-static int32_t mix_f32(audio_source *audio, void *vstream, int len)
+static void clamp_f32(float *samples, void *vstream, int sample_count)
 {
-	int samples = len/(sizeof(float)*2);
-	float *stream = vstream;
-	float *end = stream + 2*samples;
+	for (; sample_count > 0; sample_count--, samples++)
+	{
+		float sample = *samples;
+		if (sample > 1.0f) {
+			sample = 1.0f;
+		} else if (sample < -1.0f) {
+			sample = -1.0f;
+		}
+		*samples = sample;
+	}
+}
+
+static int32_t mix_f32(audio_source *audio, float *stream, int samples)
+{
+	float *end = stream + samples;
 	int16_t *src = audio->front;
 	uint32_t i = audio->read_start;
 	uint32_t i_end = audio->read_end;
 	float *cur = stream;
+	float gain_mult = audio->gain_mult * overall_gain_mult;
 	size_t first_add = output_channels > 1 ? 1 : 0, second_add = output_channels > 1 ? output_channels - 1 : 1;
 	if (audio->num_channels == 1) {
 		while (cur < end && i != i_end)
 		{
-			*cur += ((float)src[i]) / 0x7FFF;
+			*cur += gain_mult * ((float)src[i]) / 0x7FFF;
 			cur += first_add;
-			*cur += ((float)src[i++]) / 0x7FFF;
+			*cur += gain_mult * ((float)src[i++]) / 0x7FFF;
 			cur += second_add;
 			i &= audio->mask;
 		}
 	} else {
 		while(cur < end && i != i_end)
 		{
-			*cur += ((float)src[i++]) / 0x7FFF;
+			*cur += gain_mult * ((float)src[i++]) / 0x7FFF;
 			cur += first_add;
-			*cur += ((float)src[i++]) / 0x7FFF;
+			*cur += gain_mult * ((float)src[i++]) / 0x7FFF;
 			cur += second_add;
 			i &= audio->mask;
 		}
@@ -158,24 +153,18 @@ static int32_t mix_f32(audio_source *audio, void *vstream, int len)
 		audio->read_start = i;
 	}
 	if (cur != end) {
-		printf("Underflow of %d samples, read_start: %d, read_end: %d, mask: %X\n", (int)(end-cur)/2, audio->read_start, audio->read_end, audio->mask);
+		debug_message("Underflow of %d samples, read_start: %d, read_end: %d, mask: %X\n", (int)(end-cur)/2, audio->read_start, audio->read_end, audio->mask);
 		return (cur-end)/2;
 	} else {
 		return ((i_end - i) & audio->mask) / audio->num_channels;
 	}
 }
 
-static int32_t mix_null(audio_source *audio, void *vstream, int len)
-{
-	return 0;
-}
-
-static mix_func mix;
+static conv_func convert;
 
 static void audio_callback(void * userdata, uint8_t *byte_stream, int len)
 {
 	uint8_t num_populated;
-	memset(byte_stream, 0, len);
 	SDL_LockMutex(audio_mutex);
 		do {
 			num_populated = 0;
@@ -190,14 +179,18 @@ static void audio_callback(void * userdata, uint8_t *byte_stream, int len)
 				SDL_CondWait(audio_ready, audio_mutex);
 			}
 		} while(!quitting && num_populated < num_audio_sources);
+		int samples = len / sample_size;
+		float *mix_dest = mix_buf ? mix_buf : (float *)byte_stream;
+		memset(mix_dest, 0, samples * sizeof(float));
 		if (!quitting) {
 			for (uint8_t i = 0; i < num_audio_sources; i++)
 			{
-				mix(audio_sources[i], byte_stream, len);
+				mix_f32(audio_sources[i], mix_dest, samples);
 				audio_sources[i]->front_populated = 0;
 				SDL_CondSignal(audio_sources[i]->cond);
 			}
 		}
+		convert(mix_dest, byte_stream, samples);
 	SDL_UnlockMutex(audio_mutex);
 }
 
@@ -211,21 +204,24 @@ static int32_t cur_min_buffered;
 static uint32_t min_remaining_buffer;
 static void audio_callback_drc(void *userData, uint8_t *byte_stream, int len)
 {
-	memset(byte_stream, 0, len);
 	if (cur_min_buffered < 0) {
 		//underflow last frame, but main thread hasn't gotten a chance to call SDL_PauseAudio yet
 		return;
 	}
 	cur_min_buffered = 0x7FFFFFFF;
 	min_remaining_buffer = 0xFFFFFFFF;
+	float *mix_dest = mix_buf ? mix_buf : (float *)byte_stream;	
+	int samples = len / sample_size;
+	memset(mix_dest, 0, samples * sizeof(float));
 	for (uint8_t i = 0; i < num_audio_sources; i++)
 	{
 		
-		int32_t buffered = mix(audio_sources[i], byte_stream, len);
+		int32_t buffered = mix_f32(audio_sources[i], mix_dest, samples);
 		cur_min_buffered = buffered < cur_min_buffered ? buffered : cur_min_buffered;
 		uint32_t remaining = (audio_sources[i]->mask + 1)/audio_sources[i]->num_channels - buffered;
 		min_remaining_buffer = remaining < min_remaining_buffer ? remaining : min_remaining_buffer;
 	}
+	convert(mix_dest, byte_stream, samples);
 }
 
 static void lock_audio()
@@ -253,6 +249,10 @@ static void render_close_audio()
 		SDL_CondSignal(audio_ready);
 	SDL_UnlockMutex(audio_mutex);
 	SDL_CloseAudio();
+	if (mix_buf) {
+		free(mix_buf);
+		mix_buf = NULL;
+	}
 }
 
 #define BUFFER_INC_RES 0x40000000UL
@@ -292,11 +292,22 @@ audio_source *render_audio_source(uint64_t master_clock, uint64_t sample_divider
 		ret->read_start = 0;
 		ret->read_end = sync_to_audio ? buffer_samples * channels : 0;
 		ret->mask = sync_to_audio ? 0xFFFFFFFF : alloc_size-1;
+		ret->gain_mult = 1.0f;
 	}
 	if (sync_to_audio && SDL_GetAudioStatus() == SDL_AUDIO_PAUSED) {
 		SDL_PauseAudio(0);
 	}
 	return ret;
+}
+
+static float db_to_mult(float gain)
+{
+	return powf(10.0f, gain/20.0f);
+}
+
+void render_audio_source_gaindb(audio_source *src, float gain)
+{
+	src->gain_mult = db_to_mult(gain);
 }
 
 void render_pause_source(audio_source *src)
@@ -486,12 +497,15 @@ static const GLchar shader_prefix[] =
 
 static GLuint load_shader(char * fname, GLenum shader_type)
 {
-	char const * parts[] = {get_home_dir(), "/.config/blastem/shaders/", fname};
-	char * shader_path = alloc_concat_m(3, parts);
-	FILE * f = fopen(shader_path, "rb");
-	free(shader_path);
-	GLchar * text;
+	char * shader_path;
+	FILE *f;
+	GLchar *text;
 	long fsize;
+#ifndef __ANDROID__
+	char const * parts[] = {get_home_dir(), "/.config/blastem/shaders/", fname};
+	shader_path = alloc_concat_m(3, parts);
+	f = fopen(shader_path, "rb");
+	free(shader_path);
 	if (f) {
 		fsize = file_size(f);
 		text = malloc(fsize);
@@ -501,6 +515,7 @@ static GLuint load_shader(char * fname, GLenum shader_type)
 			return 0;
 		}
 	} else {
+#endif
 		shader_path = path_append("shaders", fname);
 		uint32_t fsize32;
 		text = read_bundled_file(shader_path, &fsize32);
@@ -510,7 +525,10 @@ static GLuint load_shader(char * fname, GLenum shader_type)
 			return 0;
 		}
 		fsize = fsize32;
+#ifndef __ANDROID__
 	}
+#endif
+	text[fsize] = 0;
 	
 	if (strncmp(text, "#version", strlen("#version"))) {
 		GLchar *tmp = text;
@@ -519,6 +537,10 @@ static GLuint load_shader(char * fname, GLenum shader_type)
 		fsize += strlen(shader_prefix);
 	}
 	GLuint ret = glCreateShader(shader_type);
+	if (!ret) {
+		warning("glCreateShader failed with error %d\n", glGetError());
+		return 0;
+	}
 	glShaderSource(ret, 1, (const GLchar **)&text, (const GLint *)&fsize);
 	free(text);
 	glCompileShader(ret);
@@ -538,7 +560,9 @@ static GLuint load_shader(char * fname, GLenum shader_type)
 #endif
 
 static uint32_t texture_buf[512 * 513];
-#ifndef DISABLE_OPENGL
+#ifdef DISABLE_OPENGL
+#define RENDER_FORMAT SDL_PIXELFORMAT_ARGB8888
+#else
 #ifdef USE_GLES
 #define INTERNAL_FORMAT GL_RGBA
 #define SRC_FORMAT GL_RGBA
@@ -683,7 +707,9 @@ static float config_aspect()
 static void update_aspect()
 {
 	//reset default values
+#ifndef DISABLE_OPENGL
 	memcpy(vertex_data, vertex_data_default, sizeof(vertex_data));
+#endif
 	main_clip.w = main_width;
 	main_clip.h = main_height;
 	main_clip.x = main_clip.y = 0;
@@ -715,11 +741,16 @@ static void update_aspect()
 	}
 }
 
-static ui_render_fun on_context_destroyed, on_context_created;
+static ui_render_fun on_context_destroyed, on_context_created, on_ui_fb_resized;
 void render_set_gl_context_handlers(ui_render_fun destroy, ui_render_fun create)
 {
 	on_context_destroyed = destroy;
 	on_context_created = create;
+}
+
+void render_set_ui_fb_resize_handler(ui_render_fun resize)
+{
+	on_ui_fb_resized = resize;
 }
 
 static uint8_t scancode_map[SDL_NUM_SCANCODES] = {
@@ -890,6 +921,7 @@ static uint32_t overscan_bot[NUM_VID_STD] = {1, 17};
 static uint32_t overscan_left[NUM_VID_STD] = {13, 13};
 static uint32_t overscan_right[NUM_VID_STD] = {14, 14};
 static vid_std video_standard = VID_NTSC;
+static uint8_t need_ui_fb_resize;
 
 static int32_t handle_event(SDL_Event *event)
 {
@@ -922,8 +954,8 @@ static int32_t handle_event(SDL_Event *event)
 				SDL_Joystick * joy = joysticks[index] = SDL_JoystickOpen(event->jdevice.which);
 				joystick_sdl_index[index] = event->jdevice.which;
 				if (joy) {
-					printf("Joystick %d added: %s\n", index, SDL_JoystickName(joy));
-					printf("\tNum Axes: %d\n\tNum Buttons: %d\n\tNum Hats: %d\n", SDL_JoystickNumAxes(joy), SDL_JoystickNumButtons(joy), SDL_JoystickNumHats(joy));
+					debug_message("Joystick %d added: %s\n", index, SDL_JoystickName(joy));
+					debug_message("\tNum Axes: %d\n\tNum Buttons: %d\n\tNum Hats: %d\n", SDL_JoystickNumAxes(joy), SDL_JoystickNumButtons(joy), SDL_JoystickNumHats(joy));
 					handle_joy_added(index);
 				}
 			}
@@ -934,9 +966,9 @@ static int32_t handle_event(SDL_Event *event)
 		if (index >= 0) {
 			SDL_JoystickClose(joysticks[index]);
 			joysticks[index] = NULL;
-			printf("Joystick %d removed\n", index);
+			debug_message("Joystick %d removed\n", index);
 		} else {
-			printf("Failed to find removed joystick with instance ID: %d\n", index);
+			debug_message("Failed to find removed joystick with instance ID: %d\n", index);
 		}
 		break;
 	}
@@ -953,8 +985,12 @@ static int32_t handle_event(SDL_Event *event)
 		switch (event->window.event)
 		{
 		case SDL_WINDOWEVENT_SIZE_CHANGED:
+			if (!main_window) {
+				break;
+			}
 			main_width = event->window.data1;
 			main_height = event->window.data2;
+			need_ui_fb_resize = 1;
 			update_aspect();
 #ifndef DISABLE_OPENGL
 			if (render_gl) {
@@ -972,7 +1008,7 @@ static int32_t handle_event(SDL_Event *event)
 #endif
 			break;
 		case SDL_WINDOWEVENT_CLOSE:
-			if (SDL_GetWindowID(main_window) == event->window.windowID) {
+			if (main_window && SDL_GetWindowID(main_window) == event->window.windowID) {
 				exit(0);
 			} else {
 				for (int i = 0; i < num_textures - FRAMEBUFFER_USER_START; i++)
@@ -1026,14 +1062,14 @@ static void init_audio()
    		rate = 48000;
    	}
     desired.freq = rate;
-	desired.format = AUDIO_S16SYS;
+	desired.format = AUDIO_F32SYS;
 	desired.channels = 2;
     char * samples_str = tern_find_path(config, "audio\0buffer\0", TVAL_PTR).ptrval;
    	int samples = samples_str ? atoi(samples_str) : 0;
    	if (!samples) {
    		samples = 512;
    	}
-    printf("config says: %d\n", samples);
+    debug_message("config says: %d\n", samples);
     desired.samples = samples*2;
 	desired.callback = sync_to_audio ? audio_callback : audio_callback_drc;
 	desired.userdata = NULL;
@@ -1044,18 +1080,24 @@ static void init_audio()
 	buffer_samples = actual.samples;
 	sample_rate = actual.freq;
 	output_channels = actual.channels;
-	printf("Initialized audio at frequency %d with a %d sample buffer, ", actual.freq, actual.samples);
+	debug_message("Initialized audio at frequency %d with a %d sample buffer, ", actual.freq, actual.samples);
+	sample_size = SDL_AUDIO_BITSIZE(actual.format) / 8;
 	if (actual.format == AUDIO_S16SYS) {
-		puts("signed 16-bit int format");
-		mix = mix_s16;
+		debug_message("signed 16-bit int format\n");
+		convert = convert_s16;
+		mix_buf = calloc(output_channels * buffer_samples, sizeof(float));
 	} else if (actual.format == AUDIO_F32SYS) {
-		puts("32-bit float format");
-		mix = mix_f32;
+		debug_message("32-bit float format\n");
+		convert = clamp_f32;
+		mix_buf = NULL;
 	} else {
-		printf("unsupported format %X\n", actual.format);
+		debug_message("unsupported format %X\n", actual.format);
 		warning("Unsupported audio sample format: %X\n", actual.format);
-		mix = mix_null;
+		convert = convert_null;
+		mix_buf = calloc(output_channels * buffer_samples, sizeof(float));
 	}
+	char * gain_str = tern_find_path(config, "audio\0gain\0", TVAL_PTR).ptrval;
+	overall_gain_mult = db_to_mult(gain_str ? atof(gain_str) : 0.0f);
 }
 
 void window_setup(void)
@@ -1154,7 +1196,11 @@ void window_setup(void)
 			}
 			if (vsync) {
 				if (SDL_GL_SetSwapInterval(!strcmp("on", vsync)) < 0) {
+#ifdef __ANDROID__
+					debug_message("Failed to set vsync to %s: %s\n", vsync, SDL_GetError());
+#else
 					warning("Failed to set vsync to %s: %s\n", vsync, SDL_GetError());
+#endif
 				}
 			}
 		} else {
@@ -1174,7 +1220,7 @@ void window_setup(void)
 		}
 		SDL_RendererInfo rinfo;
 		SDL_GetRendererInfo(main_renderer, &rinfo);
-		printf("SDL2 Render Driver: %s\n", rinfo.name);
+		debug_message("SDL2 Render Driver: %s\n", rinfo.name);
 		main_clip.x = main_clip.y = 0;
 		main_clip.w = main_width;
 		main_clip.h = main_height;
@@ -1183,7 +1229,7 @@ void window_setup(void)
 #endif
 
 	SDL_GetWindowSize(main_window, &main_width, &main_height);
-	printf("Window created with size: %d x %d\n", main_width, main_height);
+	debug_message("Window created with size: %d x %d\n", main_width, main_height);
 	update_aspect();
 	render_alloc_surfaces();
 	def.ptrval = "off";
@@ -1200,7 +1246,7 @@ void render_init(int width, int height, char * title, uint8_t fullscreen)
 		float aspect = config_aspect() > 0.0f ? config_aspect() : 4.0f/3.0f;
 		height = ((float)width / aspect) + 0.5f;
 	}
-	printf("width: %d, height: %d\n", width, height);
+	debug_message("width: %d, height: %d\n", width, height);
 	windowed_width = width;
 	windowed_height = height;
 	
@@ -1233,7 +1279,7 @@ void render_init(int width, int height, char * title, uint8_t fullscreen)
 	if (db_data) {
 		int added = SDL_GameControllerAddMappingsFromRW(SDL_RWFromMem(db_data, db_size), 1);
 		free(db_data);
-		printf("Added %d game controller mappings from gamecontrollerdb.txt\n", added);
+		debug_message("Added %d game controller mappings from gamecontrollerdb.txt\n", added);
 	}
 	
 	controller_add_mappings();
@@ -1287,6 +1333,7 @@ void render_config_updated(void)
 #endif
 	in_toggle = 1;
 	SDL_DestroyWindow(main_window);
+	main_window = NULL;
 	drain_events();
 	
 	char *config_width = tern_find_path(config, "video\0width\0", TVAL_PTR).ptrval;
@@ -1311,6 +1358,9 @@ void render_config_updated(void)
 	} else {
 		main_width = windowed_width;
 		main_height = windowed_height;
+	}
+	if (on_ui_fb_resized) {
+		on_ui_fb_resized();
 	}
 	
 	window_setup();
@@ -1386,7 +1436,7 @@ void render_set_video_standard(vid_std std)
 	max_repeat++;
 	min_buffered = (((float)max_repeat * (float)sample_rate/(float)source_hz)/* / (float)buffer_samples*/);// + 0.9999;
 	//min_buffered *= buffer_samples;
-	printf("Min samples buffered before audio start: %d\n", min_buffered);
+	debug_message("Min samples buffered before audio start: %d\n", min_buffered);
 	max_adjust = BASE_MAX_ADJUST / source_hz;
 }
 
@@ -1471,6 +1521,16 @@ uint32_t *render_get_framebuffer(uint8_t which, int *pitch)
 		return texture_buf;
 	} else {
 #endif
+		if (which == FRAMEBUFFER_UI && which >= num_textures) {
+			sdl_textures = realloc(sdl_textures, sizeof(*sdl_textures) * (FRAMEBUFFER_UI + 1));
+			for (; num_textures <= FRAMEBUFFER_UI; num_textures++)
+			{
+				sdl_textures[num_textures] = NULL;
+			}
+		}
+		if (which == FRAMEBUFFER_UI && !sdl_textures[which]) {
+			sdl_textures[which] = SDL_CreateTexture(main_renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, main_width, main_height);
+		}
 		if (which >= num_textures) {
 			warning("Request for invalid framebuffer number %d\n", which);
 			return NULL;
@@ -1608,6 +1668,16 @@ void render_framebuffer_updated(uint8_t which, int width)
 	last_height = height;
 	if (which <= FRAMEBUFFER_EVEN) {
 		render_update_display();
+	} else if (which == FRAMEBUFFER_UI) {
+		SDL_RenderCopy(main_renderer, sdl_textures[which], NULL, NULL);
+		if (need_ui_fb_resize) {
+			SDL_DestroyTexture(sdl_textures[which]);
+			sdl_textures[which] = NULL;
+			if (on_ui_fb_resized) {
+				on_ui_fb_resized();
+			}
+			need_ui_fb_resize = 0;
+		}
 	} else {
 		SDL_RenderCopy(extra_renderers[which - FRAMEBUFFER_USER_START], sdl_textures[which], NULL, NULL);
 		SDL_RenderPresent(extra_renderers[which - FRAMEBUFFER_USER_START]);
@@ -1623,7 +1693,7 @@ void render_framebuffer_updated(uint8_t which, int width)
 		if ((last_frame - start) > FPS_INTERVAL) {
 			if (start && (last_frame-start)) {
 	#ifdef __ANDROID__
-				info_message("%s - %.1f fps", caption, ((float)frame_counter) / (((float)(last_frame-start)) / 1000.0));
+				debug_message("%s - %.1f fps", caption, ((float)frame_counter) / (((float)(last_frame-start)) / 1000.0));
 	#else
 				if (!fps_caption) {
 					fps_caption = malloc(strlen(caption) + strlen(" - 100000000.1 fps") + 1);
@@ -1846,6 +1916,7 @@ int32_t render_translate_input_name(int32_t controller, char *name, uint8_t is_a
 	}
 	
 	SDL_GameControllerButtonBind cbind;
+	int32_t is_positive = RENDER_AXIS_POS;
 	if (is_axis) {
 		
 		int sdl_axis = render_lookup_axis(name);
@@ -1860,6 +1931,10 @@ int32_t render_translate_input_name(int32_t controller, char *name, uint8_t is_a
 			SDL_GameControllerClose(control);
 			return RENDER_INVALID_NAME;
 		}
+		if (sdl_button == SDL_CONTROLLER_BUTTON_DPAD_UP || sdl_button == SDL_CONTROLLER_BUTTON_DPAD_LEFT) {
+			//assume these will be negative if they are an axis
+			is_positive = 0;
+		}
 		cbind = SDL_GameControllerGetBindForButton(control, sdl_button);
 	}
 	SDL_GameControllerClose(control);
@@ -1868,7 +1943,7 @@ int32_t render_translate_input_name(int32_t controller, char *name, uint8_t is_a
 	case SDL_CONTROLLER_BINDTYPE_BUTTON:
 		return cbind.value.button;
 	case SDL_CONTROLLER_BINDTYPE_AXIS:
-		return RENDER_AXIS_BIT | cbind.value.axis;
+		return RENDER_AXIS_BIT | cbind.value.axis | is_positive;
 	case SDL_CONTROLLER_BINDTYPE_HAT:
 		return RENDER_DPAD_BIT | (cbind.value.hat.hat << 4) | cbind.value.hat.hat_mask;
 	}
@@ -1939,6 +2014,7 @@ void render_toggle_fullscreen()
 	SDL_SetWindowSize(main_window, windowed_width, windowed_height);
 	drain_events();
 	in_toggle = 0;
+	need_ui_fb_resize = 1;
 }
 
 uint32_t render_audio_buffer()

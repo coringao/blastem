@@ -293,6 +293,46 @@ void add_memmap_header(rom_info *info, uint8_t *rom, uint32_t size, memmap_chunk
 		info->map[8].write_16 = (write_16_fun)write_bank_reg_w;
 		info->map[8].write_8 = (write_8_fun)write_bank_reg_b;
 		return;
+	} else if(!memcmp("SEGA MEGAWIFI", rom + 0x100, strlen("SEGA MEGAWIFI"))) {
+		info->mapper_type = MAPPER_NONE;
+		info->map_chunks = base_chunks + 2;
+		info->map = malloc(sizeof(memmap_chunk) * info->map_chunks);
+		memset(info->map, 0, sizeof(memmap_chunk)*2);
+		memcpy(info->map+2, base_map, sizeof(memmap_chunk) * base_chunks);
+		info->save_size = 0x400000;
+		info->save_bus = RAM_FLAG_BOTH;
+		info->save_type = SAVE_NOR;
+		info->map[0].start = 0;
+		info->map[0].end = 0x400000;
+		info->map[0].mask = 0xFFFFFF;
+		info->map[0].write_16 = nor_flash_write_w;
+		info->map[0].write_8 = nor_flash_write_b;
+		info->map[0].read_16 = nor_flash_read_w;
+		info->map[0].read_8 = nor_flash_read_b;
+		info->map[0].flags = MMAP_READ_CODE | MMAP_CODE;
+		info->map[0].buffer = info->save_buffer = malloc(info->save_size);
+		uint32_t init_size = size < info->save_size ? size : info->save_size;
+		memcpy(info->save_buffer, rom, init_size);
+		byteswap_rom(info->save_size, (uint16_t *)info->save_buffer);
+		info->nor = calloc(1, sizeof(nor_state));
+		nor_flash_init(info->nor, info->save_buffer, info->save_size, 128, 0xDA45, RAM_FLAG_BOTH);
+		info->nor->cmd_address1 = 0xAAB;
+		info->nor->cmd_address2 = 0x555;
+		info->map[1].start = 0xA130C0;
+		info->map[1].end = 0xA130D0;
+		info->map[1].mask = 0xFFFFFF;
+		if (!strcmp(
+			"on", 
+			tern_find_path_default(config, "system\0megawifi\0", (tern_val){.ptrval="off"}, TVAL_PTR).ptrval)
+		) {
+			info->map[1].write_16 = megawifi_write_w;
+			info->map[1].write_8 = megawifi_write_b;
+			info->map[1].read_16 = megawifi_read_w;
+			info->map[1].read_8 = megawifi_read_b;
+		} else {
+			warning("ROM uses MegaWiFi, but it is disabled\n");
+		}
+		return;
 	} else if (has_ram_header(rom, size)) {
 		uint32_t ram_start = read_ram_header(info, rom);
 
@@ -560,7 +600,7 @@ void add_eeprom_map(tern_node *node, uint32_t start, uint32_t end, map_iter_stat
 	if (bits_write) {
 		tern_foreach(bits_write, eeprom_write_fun, eep_map);
 	}
-	printf("EEPROM address %X: sda read: %X, sda write: %X, scl: %X\n", start, eep_map->sda_read_bit, eep_map->sda_write_mask, eep_map->scl_mask);
+	debug_message("EEPROM address %X: sda read: %X, sda write: %X, scl: %X\n", start, eep_map->sda_read_bit, eep_map->sda_write_mask, eep_map->scl_mask);
 	state->info->num_eeprom++;
 }
 
@@ -771,12 +811,14 @@ void map_iter_fun(char *key, tern_val val, uint8_t valtype, void *data)
 		map->mask = 0xFF;
 		map->write_16 = (write_16_fun)write_bank_reg_w;
 		map->write_8 = (write_8_fun)write_bank_reg_b;
+#ifndef IS_LIB
 	} else if (!strcmp(dtype, "MENU")) {
 		//fake hardware for supporting menu
 		map->buffer = NULL;
 		map->mask = 0xFF;
 		map->write_16 = menu_write_w;
 		map->read_16 = menu_read_w;
+#endif
 	} else if (!strcmp(dtype, "fixed")) {
 		uint16_t *value =  malloc(2);
 		map->buffer = value;
@@ -847,18 +889,18 @@ rom_info configure_rom(tern_node *rom_db, void *vrom, uint32_t rom_size, void *l
 		product_id[i] = rom[GAME_ID_OFF + i];
 
 	}
-	printf("Product ID: %s\n", product_id);
+	debug_message("Product ID: %s\n", product_id);
 	uint8_t raw_hash[20];
 	sha1(vrom, rom_size, raw_hash);
 	uint8_t hex_hash[41];
 	bin_to_hex(hex_hash, raw_hash, 20);
-	printf("SHA1: %s\n", hex_hash);
+	debug_message("SHA1: %s\n", hex_hash);
 	tern_node * entry = tern_find_node(rom_db, hex_hash);
 	if (!entry) {
 		entry = tern_find_node(rom_db, product_id);
 	}
 	if (!entry) {
-		puts("Not found in ROM DB, examining header\n");
+		debug_message("Not found in ROM DB, examining header\n\n");
 		if (xband_detect(rom, rom_size)) {
 			return xband_configure_rom(rom_db, rom, rom_size, lock_on, lock_on_size, base_map, base_chunks);
 		}
@@ -871,7 +913,7 @@ rom_info configure_rom(tern_node *rom_db, void *vrom, uint32_t rom_size, void *l
 	info.mapper_type = MAPPER_NONE;
 	info.name = tern_find_ptr(entry, "name");
 	if (info.name) {
-		printf("Found name: %s\n", info.name);
+		debug_message("Found name: %s\n\n", info.name);
 		info.name = strdup(info.name);
 	} else {
 		info.name = get_header_name(rom);

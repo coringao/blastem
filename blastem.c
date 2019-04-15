@@ -34,7 +34,7 @@
 #include "nuklear_ui/blastem_nuklear.h"
 #endif
 
-#define BLASTEM_VERSION "0.6.2-pre"
+#define BLASTEM_VERSION "0.6.3-pre"
 
 #ifdef __ANDROID__
 #define FULLSCREEN_DEFAULT 1
@@ -154,7 +154,7 @@ uint32_t load_rom_zip(const char *filename, void **dst)
 				if (*dst) {
 					if (is_smd_format(z->entries[i].name, *dst)) {
 						size_t offset;
-						for (offset = 0; offset + SMD_BLOCK_SIZE + SMD_HEADER_SIZE < out_size; offset += SMD_BLOCK_SIZE)
+						for (offset = 0; offset + SMD_BLOCK_SIZE + SMD_HEADER_SIZE <= out_size; offset += SMD_BLOCK_SIZE)
 						{
 							uint8_t tmp[SMD_BLOCK_SIZE];
 							memcpy(tmp, *dst + offset + SMD_HEADER_SIZE, SMD_BLOCK_SIZE);

@@ -1,9 +1,13 @@
 #define NK_IMPLEMENTATION
 #define NK_SDL_GLES2_IMPLEMENTATION
+#define NK_RAWFB_IMPLEMENTATION
+#define RAWFB_RGBX_8888
 
 #include <stdlib.h>
 #include <limits.h>
+#include <math.h>
 #include "blastem_nuklear.h"
+#include "nuklear_rawfb.h"
 #include "font.h"
 #include "../render.h"
 #include "../render_sdl.h"
@@ -18,6 +22,7 @@
 #include "../bindings.h"
 
 static struct nk_context *context;
+static struct rawfb_context *fb_context;
 
 typedef struct
 {
@@ -160,8 +165,8 @@ void view_lock_on(struct nk_context *context)
 void view_about(struct nk_context *context)
 {
 	const char *lines[] = {
-		"BlastEm v0.6.1",
-		"Copyright 2012-2017 Michael Pavone",
+		"BlastEm v0.6.3-pre",
+		"Copyright 2012-2019 Michael Pavone",
 		"",
 		"BlastEm is a high performance open source",
 		"(GPLv3) Genesis/Megadrive emulator",
@@ -171,6 +176,8 @@ void view_about(struct nk_context *context)
 		"Nemesis: Documentation and test ROMs",
 		"Charles MacDonald: Documentation",
 		"Eke-Eke: Documentation",
+		"Sauraen: YM2612/YM2203 Die Analysis",
+		"Alexey Khokholov: YM3438 Die Analysis",
 		"Bart Trzynadlowski: Documentation",
 		"KanedaFR: Hosting the best Sega forum",
 		"Titan: Awesome demos and documentation",
@@ -293,6 +300,7 @@ static void menu(struct nk_context *context, uint32_t num_entries, const menu_it
 					free_slot_info(slots);
 					slots = NULL;
 				} else if (current_view == view_play) {
+					clear_view_stack();
 					set_content_binding_state(1);
 				}
 			} else {
@@ -314,6 +322,7 @@ void binding_loop(char *key, tern_val val, uint8_t valtype, void *data)
 
 static int32_t keycode;
 static const char *set_binding;
+static uint8_t bind_click_release, click;
 char *set_label;
 void binding_group(struct nk_context *context, char *name, const char **binds, const char **bind_names, uint32_t num_binds, tern_node *binding_lookup)
 {
@@ -332,6 +341,7 @@ void binding_group(struct nk_context *context, char *name, const char **binds, c
 			if (nk_button_label(context, tern_find_ptr_default(binding_lookup, binds[i], "Not Set"))) {
 				set_binding = binds[i];
 				set_label = strdup(label);
+				bind_click_release = 0;
 				keycode = 0;
 			}
 			if (label_alloc) {
@@ -483,7 +493,7 @@ void view_key_bindings(struct nk_context *context)
 		nk_layout_row_static(context, 30, width/2-30, 1);
 		nk_label(context, "Press new key for", NK_TEXT_CENTERED);
 		nk_label(context, set_label, NK_TEXT_CENTERED);
-		if (nk_button_label(context, "Cancel")) {
+		if (nk_button_label(context, "Cancel") && bind_click_release) {
 			free(set_label);
 			set_binding = set_label = NULL;
 		} else if (keycode) {
@@ -517,6 +527,8 @@ void view_key_bindings(struct nk_context *context)
 			}
 			free(set_label);
 			set_binding = set_label = NULL;
+		} else if (!click) {
+			bind_click_release = 1;
 		}
 		nk_end(context);
 	}
@@ -1054,12 +1066,19 @@ void view_controller_bindings(struct nk_context *context)
 			});
 		}
 		
-		binding_box(context, bindings, "Right Shoulder", bind_box_left, font->height/2, bind_box_width,
-			selected_controller_info.variant == VARIANT_6B_BUMPERS ? 1 : 2, 
-			(int[]){
-			selected_controller_info.variant == VARIANT_6B_RIGHT ? SDL_CONTROLLER_BUTTON_LEFTSHOULDER : SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,
-			AXIS | SDL_CONTROLLER_AXIS_TRIGGERLEFT
-		});
+		if (selected_controller_info.variant == VARIANT_NORMAL) {
+			binding_box(context, bindings, "Right Shoulder", bind_box_left, font->height/2, bind_box_width, 2, (int[]){
+				SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,
+				AXIS | SDL_CONTROLLER_AXIS_TRIGGERRIGHT
+			});
+		} else {
+			binding_box(context, bindings, "Right Shoulder", bind_box_left, font->height/2, bind_box_width,
+				selected_controller_info.variant == VARIANT_6B_BUMPERS ? 1 : 2, 
+				(int[]){
+				selected_controller_info.variant == VARIANT_6B_RIGHT ? SDL_CONTROLLER_BUTTON_LEFTSHOULDER : AXIS | SDL_CONTROLLER_AXIS_TRIGGERRIGHT,
+				AXIS | SDL_CONTROLLER_AXIS_TRIGGERLEFT
+			});
+		}
 		
 		binding_box(context, bindings, "Misc Buttons", (render_width() - bind_box_width) / 2, font->height/2, bind_box_width, 3, (int[]){
 			SDL_CONTROLLER_BUTTON_BACK,
@@ -1096,12 +1115,19 @@ void view_controller_bindings(struct nk_context *context)
 			dpad_top = img_top;
 		}
 		
-		binding_box(context, bindings, "Left Shoulder", bind_box_left, font->height/2, bind_box_width, 
-			selected_controller_info.variant == VARIANT_6B_BUMPERS ? 1 : 2, 
-			(int[]){
-			selected_controller_info.variant == VARIANT_6B_RIGHT ? SDL_CONTROLLER_BUTTON_LEFTSTICK : SDL_CONTROLLER_BUTTON_LEFTSHOULDER,
-			SDL_CONTROLLER_BUTTON_RIGHTSTICK
-		});
+		if (selected_controller_info.variant == VARIANT_NORMAL) {
+			binding_box(context, bindings, "Left Shoulder", bind_box_left, font->height/2, bind_box_width, 2, (int[]){
+				SDL_CONTROLLER_BUTTON_LEFTSHOULDER,
+				AXIS | SDL_CONTROLLER_AXIS_TRIGGERLEFT
+			});
+		} else {
+			binding_box(context, bindings, "Left Shoulder", bind_box_left, font->height/2, bind_box_width, 
+				selected_controller_info.variant == VARIANT_6B_BUMPERS ? 1 : 2, 
+				(int[]){
+				selected_controller_info.variant == VARIANT_6B_RIGHT ? SDL_CONTROLLER_BUTTON_LEFTSTICK : AXIS | SDL_CONTROLLER_AXIS_TRIGGERLEFT,
+				SDL_CONTROLLER_BUTTON_RIGHTSTICK
+			});
+		}
 		
 		binding_box(context, bindings, "D-pad", dpad_left, dpad_top, bind_box_width, 4, (int[]){
 			SDL_CONTROLLER_BUTTON_DPAD_UP,
@@ -1114,7 +1140,7 @@ void view_controller_bindings(struct nk_context *context)
 		
 		def_font->handle.height = orig_height;
 		nk_layout_row_static(context, orig_height + 4, (render_width() - 2*orig_height) / 4, 1);
-		if (nk_button_label(context, "Back")) {
+		if (nk_button_label(context, controller_binding_changed ? "Save" : "Back")) {
 			pop_view();
 			if (controller_binding_changed) {
 				push_view(view_select_binding_dest);
@@ -1128,7 +1154,7 @@ static int current_button;
 static int current_axis;
 static int button_pressed, last_button;
 static int hat_moved, hat_value, last_hat, last_hat_value;
-static int axis_moved, axis_value, last_axis;
+static int axis_moved, axis_value, last_axis, last_axis_value;
 static char *mapping_string;
 static size_t mapping_pos;
 
@@ -1206,7 +1232,11 @@ static void view_controller_mappings(struct nk_context *context)
 				
 				last_hat = hat_moved;
 				last_hat_value = hat_value;
-			} else if (axis_moved >= 0 && abs(axis_value) > 1000 && axis_moved != last_axis) {
+			} else if (axis_moved >= 0 && abs(axis_value) > 1000 && (
+					axis_moved != last_axis || (
+						axis_value/abs(axis_value) != last_axis_value/abs(axis_value) && current_button >= SDL_CONTROLLER_BUTTON_DPAD_UP
+					)
+				)) {
 				if (current_button <= SDL_CONTROLLER_BUTTON_B || axis_moved != button_a_axis) {
 					start_mapping();
 					mapping_string[mapping_pos++] = 'a';
@@ -1214,18 +1244,27 @@ static void view_controller_mappings(struct nk_context *context)
 						mapping_string[mapping_pos++] = '0' + axis_moved / 10;
 					}
 					mapping_string[mapping_pos++] = '0' + axis_moved % 10;
+					if (current_button >= SDL_CONTROLLER_BUTTON_DPAD_UP) {
+						mapping_string[mapping_pos++] = axis_value >= 0 ? '+' : '-';
+					}
 					last_axis = axis_moved;
+					last_axis_value = axis_value;
 				}
 				added_mapping = 1;
 			}
 		}
 			
-		if (added_mapping) {
+		while (added_mapping) {
 			quiet = QUIET_FRAMES;
 			if (current_button < SDL_CONTROLLER_BUTTON_MAX) {
 				current_button++;
 				if (current_button == SDL_CONTROLLER_BUTTON_MAX) {
 					current_axis = 0;
+					if (get_axis_label(&selected_controller_info, current_axis)) {
+						added_mapping = 0;
+					}
+				} else if (get_button_label(&selected_controller_info, current_button)) {
+					added_mapping = 0;
 				}
 			} else {
 				current_axis++;
@@ -1238,6 +1277,9 @@ static void view_controller_mappings(struct nk_context *context)
 					pop_view();
 					push_view(view_controller_bindings);
 					controller_binding_changed = 0;
+					added_mapping = 0;
+				} else if (get_axis_label(&selected_controller_info, current_axis)) {
+					added_mapping = 0;
 				}
 			}
 		}
@@ -1295,6 +1337,7 @@ static void view_controller_variant(struct nk_context *context)
 			last_hat = -1;
 			axis_moved = -1;
 			last_axis = -1;
+			last_axis_value = 0;
 			SDL_Joystick *joy = render_get_joystick(selected_controller);
 			const char *name = SDL_JoystickName(joy);
 			size_t namesz = strlen(name);
@@ -1433,6 +1476,21 @@ void settings_int_property(struct nk_context *context, char *label, char *name, 
 	if (val != curval) {
 		char buffer[12];
 		sprintf(buffer, "%d", val);
+		config_dirty = 1;
+		config = tern_insert_path(config, path, (tern_val){.ptrval = strdup(buffer)}, TVAL_PTR);
+	}
+}
+
+void settings_float_property(struct nk_context *context, char *label, char *name, char *path, float def, float min, float max, float step)
+{
+	char *curstr = tern_find_path(config, path, TVAL_PTR).ptrval;
+	float curval = curstr ? atof(curstr) : def;
+	nk_label(context, label, NK_TEXT_LEFT);
+	float val = curval;
+	nk_property_float(context, name, min, &val, max, step, step);
+	if (val != curval) {
+		char buffer[64];
+		sprintf(buffer, "%f", val);
 		config_dirty = 1;
 		config = tern_insert_path(config, path, (tern_val){.ptrval = strdup(buffer)}, TVAL_PTR);
 	}
@@ -1653,13 +1711,24 @@ void view_audio_settings(struct nk_context *context)
 		"128",
 		"64"
 	};
+	const char *dac[] = {
+		"zero_offset",
+		"linear"
+	};
+	const char *dac_desc[] = {
+		"Zero Offset",
+		"Linear"
+	};
 	const uint32_t num_rates = sizeof(rates)/sizeof(*rates);
 	const uint32_t num_sizes = sizeof(sizes)/sizeof(*sizes);
+	const uint32_t num_dacs = sizeof(dac)/sizeof(*dac);
 	static int32_t selected_rate = -1;
 	static int32_t selected_size = -1;
-	if (selected_rate < 0 || selected_size < 0) {
+	static int32_t selected_dac = -1;
+	if (selected_rate < 0 || selected_size < 0 || selected_dac < 0) {
 		selected_rate = find_match(rates, num_rates, "autio\0rate\0", "48000");
 		selected_size = find_match(sizes, num_sizes, "audio\0buffer\0", "512");
+		selected_dac = find_match(dac, num_dacs, "audio\0fm_dac\0", "zero_offset");
 	}
 	uint32_t width = render_width();
 	uint32_t height = render_height();
@@ -1672,6 +1741,10 @@ void view_audio_settings(struct nk_context *context)
 		selected_rate = settings_dropdown(context, "Rate in Hz", rates, num_rates, selected_rate, "audio\0rate\0");
 		selected_size = settings_dropdown(context, "Buffer Samples", sizes, num_sizes, selected_size, "audio\0buffer\0");
 		settings_int_input(context, "Lowpass Cutoff Hz", "audio\0lowpass_cutoff\0", "3390");
+		settings_float_property(context, "Gain (dB)", "Overall", "audio\0gain\0", 0, -30.0f, 30.0f, 0.5f);
+		settings_float_property(context, "", "FM", "audio\0fm_gain\0", 0, -30.0f, 30.0f, 0.5f);
+		settings_float_property(context, "", "PSG", "audio\0psg_gain\0", 0, -30.0f, 30.0f, 0.5f);
+		selected_dac = settings_dropdown_ex(context, "FM DAC", dac, dac_desc, num_dacs, selected_dac, "audio\0fm_dac\0");
 		if (nk_button_label(context, "Back")) {
 			pop_view();
 		}
@@ -1719,6 +1792,7 @@ void view_system_settings(struct nk_context *context)
 		selected_init = find_match(ram_inits, num_inits, "system\0ram_init\0", "zero");
 	}
 	const char *io_opts_1[] = {
+		"none",
 		"gamepad2.1",
 		"gamepad3.1",
 		"gamepad6.1",
@@ -1727,6 +1801,7 @@ void view_system_settings(struct nk_context *context)
 		"xband keyboard"
 	};
 	const char *io_opts_2[] = {
+		"none",
 		"gamepad2.2",
 		"gamepad3.2",
 		"gamepad6.2",
@@ -1829,7 +1904,15 @@ void blastem_nuklear_render(void)
 	if (current_view != view_play) {
 		nk_input_end(context);
 		current_view(context);
-		nk_sdl_render(NK_ANTI_ALIASING_ON, 512 * 1024, 128 * 1024);
+		if (fb_context) {
+			fb_context->fb.pixels = render_get_framebuffer(FRAMEBUFFER_UI, &fb_context->fb.pitch);
+			nk_rawfb_render(fb_context, nk_rgb(0,0,0), 0);
+			render_framebuffer_updated(FRAMEBUFFER_UI, render_width());
+		} else {
+#ifndef DISABLE_OPENGL
+			nk_sdl_render(NK_ANTI_ALIASING_ON, 512 * 1024, 128 * 1024);
+#endif
+		}
 		nk_input_begin(context);
 	}
 }
@@ -1870,6 +1953,10 @@ static void handle_event(SDL_Event *event)
 			axis_moved = event->jaxis.axis;
 			axis_value = event->jaxis.value;
 		}
+	} else if (event->type == SDL_MOUSEBUTTONDOWN && event->button.button == 0) {
+		click = 1;
+	} else if (event->type == SDL_MOUSEBUTTONUP && event->button.button == 0) {
+		click = 0;
 	}
 	nk_sdl_handle_event(event);
 }
@@ -1883,6 +1970,12 @@ static void context_destroyed(void)
 	}
 }
 
+static void fb_resize(void)
+{
+	nk_rawfb_resize_fb(fb_context, NULL, render_width(), render_height(), 0);
+}
+
+#ifndef DISABLE_OPENGL
 static struct nk_image load_image_texture(uint32_t *buf, uint32_t width, uint32_t height)
 {
 	GLuint tex;
@@ -1899,11 +1992,29 @@ static struct nk_image load_image_texture(uint32_t *buf, uint32_t width, uint32_
 #endif
 	return nk_image_id((int)tex);
 }
+#endif
+
+static struct nk_image load_image_rawfb(uint32_t *buf, uint32_t width, uint32_t height)
+{
+	struct rawfb_image *fbimg = calloc(1, sizeof(struct rawfb_image));
+	fbimg->pixels = buf;
+	fbimg->pitch = width * sizeof(uint32_t);
+	fbimg->w = width;
+	fbimg->h = height;
+	fbimg->format = NK_FONT_ATLAS_RGBA32;
+	return nk_image_ptr(fbimg);
+}
 
 static void texture_init(void)
 {
 	struct nk_font_atlas *atlas;
-	nk_sdl_font_stash_begin(&atlas);
+	if (fb_context) {
+		nk_rawfb_font_stash_begin(fb_context, &atlas);
+	} else {
+#ifndef DISABLE_OPENGL
+		nk_sdl_font_stash_begin(&atlas);
+#endif
+	}
 	uint32_t font_size;
 	uint8_t *font = default_font(&font_size);
 	if (!font) {
@@ -1911,27 +2022,60 @@ static void texture_init(void)
 	}
 	def_font = nk_font_atlas_add_from_memory(atlas, font, font_size, render_height() / 16, NULL);
 	free(font);
-	nk_sdl_font_stash_end();
+	if (fb_context) {
+		nk_rawfb_font_stash_end(fb_context);
+	} else {
+#ifndef DISABLE_OPENGL
+		nk_sdl_font_stash_end();
+#endif
+	}
 	nk_style_set_font(context, &def_font->handle);
 	for (uint32_t i = 0; i < num_ui_images; i++)
 	{
-		ui_images[i]->ui = load_image_texture(ui_images[i]->image_data, ui_images[i]->width, ui_images[i]->height);
+#ifndef DISABLE_OPENGL
+		if (fb_context) {
+#endif
+			ui_images[i]->ui = load_image_rawfb(ui_images[i]->image_data, ui_images[i]->width, ui_images[i]->height);
+#ifndef DISABLE_OPENGL
+		} else {
+			ui_images[i]->ui = load_image_texture(ui_images[i]->image_data, ui_images[i]->width, ui_images[i]->height);
+		}
+#endif
 	}
+}
+
+static void style_init(void)
+{
+	context->style.checkbox.padding.x = render_height() / 120;
+	context->style.checkbox.padding.y = render_height() / 120;
+	context->style.checkbox.border = render_height() / 240;
+	context->style.checkbox.cursor_normal.type = NK_STYLE_ITEM_COLOR;
+	context->style.checkbox.cursor_normal.data.color = (struct nk_color){
+		.r = 255, .g = 128, .b = 0, .a = 255
+	};
+	context->style.checkbox.cursor_hover = context->style.checkbox.cursor_normal;
 }
 
 static void context_created(void)
 {
 	context = nk_sdl_init(render_get_window());
+	nk_sdl_device_create();
+	style_init();
 	texture_init();
 }
 
 void show_pause_menu(void)
 {
-	set_content_binding_state(0);
-	context->style.window.background = nk_rgba(0, 0, 0, 128);
-	context->style.window.fixed_background = nk_style_item_color(nk_rgba(0, 0, 0, 128));
-	current_view = view_pause;
-	current_system->request_exit(current_system);
+	if (current_view == view_play) {
+		set_content_binding_state(0);
+		context->style.window.background = nk_rgba(0, 0, 0, 128);
+		context->style.window.fixed_background = nk_style_item_color(nk_rgba(0, 0, 0, 128));
+		current_view = view_pause;
+		current_system->request_exit(current_system);
+	} else if (current_system && !set_binding) {
+		clear_view_stack();
+		show_play_view();
+	}
 }
 
 void show_play_view(void)
@@ -1948,10 +2092,10 @@ uint8_t is_nuklear_active(void)
 
 uint8_t is_nuklear_available(void)
 {
-	if (!render_has_gl()) {
+	/*if (!render_has_gl()) {
 		//currently no fallback if GL2 unavailable
 		return 0;
-	}
+	}*/
 	char *style = tern_find_path(config, "ui\0style\0", TVAL_PTR).ptrval;
 	if (!style) {
 		return 1;
@@ -2001,6 +2145,17 @@ ui_image *load_ui_image(char *name)
 void blastem_nuklear_init(uint8_t file_loaded)
 {
 	context = nk_sdl_init(render_get_window());
+#ifndef DISABLE_OPENGL
+	if (render_has_gl()) {
+		nk_sdl_device_create();
+	} else {
+#endif
+		fb_context = nk_rawfb_init(NULL, context, render_width(), render_height(), 0);
+		render_set_ui_fb_resize_handler(fb_resize);
+#ifndef DISABLE_OPENGL
+	}
+#endif
+	style_init();
 	
 	controller_360 = load_ui_image("images/360.png");
 	controller_ps4 = load_ui_image("images/ps4.png");

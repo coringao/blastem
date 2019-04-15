@@ -69,7 +69,7 @@ RETRO_API unsigned retro_api_version(void)
 RETRO_API void retro_get_system_info(struct retro_system_info *info)
 {
 	info->library_name = "BlastEm";
-	info->library_version = "0.6.2-pre"; //TODO: share this with blastem.c
+	info->library_version = "0.6.3-pre"; //TODO: share this with blastem.c
 	info->valid_extensions = "md|gen|sms|bin|rom";
 	info->need_fullpath = 0;
 	info->block_extract = 0;
@@ -284,6 +284,11 @@ void render_set_video_standard(vid_std std)
 	video_standard = std;
 }
 
+int render_fullscreen(void)
+{
+	return 1;
+}
+
 void process_events()
 {
 	static int16_t prev_state[2][RETRO_DEVICE_ID_JOYPAD_L2];
@@ -341,6 +346,11 @@ void render_audio_adjust_clock(audio_source *src, uint64_t master_clock, uint64_
 {
 }
 
+void render_audio_source_gaindb(audio_source *src, float gain)
+{
+	//TODO: Implement this once I hook up a core option for individual FM/PSG gain
+}
+
 static void check_put_sample(void)
 {
 	for (int i = 0; i < num_audio_sources; i++)
@@ -391,4 +401,16 @@ void render_free_source(audio_source *src)
 
 void bindings_set_mouse_mode(uint8_t mode)
 {
+}
+
+extern const char rom_db_data[];
+char *read_bundled_file(char *name, uint32_t *sizeret)
+{
+	if (!strcmp(name, "rom.db")) {
+		*sizeret = strlen(rom_db_data);
+		char *ret = malloc(*sizeret+1);
+		memcpy(ret, rom_db_data, *sizeret + 1);
+		return ret;
+	}
+	return NULL;
 }

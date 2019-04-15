@@ -74,7 +74,8 @@
 
 #define FRAMEBUFFER_ODD 0
 #define FRAMEBUFFER_EVEN 1
-#define FRAMEBUFFER_USER_START 2
+#define FRAMEBUFFER_UI 2
+#define FRAMEBUFFER_USER_START 3
 
 #include "vdp.h"
 
@@ -86,6 +87,7 @@ typedef enum {
 
 #define RENDER_DPAD_BIT 0x40000000
 #define RENDER_AXIS_BIT 0x20000000
+#define RENDER_AXIS_POS 0x10000000
 #define RENDER_INVALID_NAME -1
 #define RENDER_NOT_MAPPED -2
 #define RENDER_NOT_PLUGGED_IN -3
@@ -93,6 +95,7 @@ typedef enum {
 typedef struct audio_source audio_source;
 typedef void (*drop_handler)(const char *filename);
 typedef void (*window_close_handler)(uint8_t which);
+typedef void (*ui_render_fun)(void);
 
 uint32_t render_map_color(uint8_t r, uint8_t g, uint8_t b);
 void render_save_screenshot(char *path);
@@ -131,6 +134,7 @@ uint32_t render_elapsed_ms(void);
 void render_sleep_ms(uint32_t delay);
 uint8_t render_has_gl(void);
 audio_source *render_audio_source(uint64_t master_clock, uint64_t sample_divider, uint8_t channels);
+void render_audio_source_gaindb(audio_source *src, float gain);
 void render_audio_adjust_clock(audio_source *src, uint64_t master_clock, uint64_t sample_divider);
 void render_put_mono_sample(audio_source *src, int16_t value);
 void render_put_stereo_sample(audio_source *src, int16_t left, int16_t right);
@@ -138,6 +142,9 @@ void render_pause_source(audio_source *src);
 void render_resume_source(audio_source *src);
 void render_free_source(audio_source *src);
 void render_config_updated(void);
+void render_set_gl_context_handlers(ui_render_fun destroy, ui_render_fun create);
+void render_set_ui_render_fun(ui_render_fun);
+void render_set_ui_fb_resize_handler(ui_render_fun resize);
 
 #endif //RENDER_H_
 

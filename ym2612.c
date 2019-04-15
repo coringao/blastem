@@ -256,6 +256,7 @@ void ym_init(ym2612_context * context, uint32_t master_clock, uint32_t clock_div
 		}
 	}
 	ym_reset(context);
+	ym_enable_zero_offset(context, 1);
 }
 
 void ym_free(ym2612_context *context)
@@ -267,8 +268,18 @@ void ym_free(ym2612_context *context)
 	free(context);
 }
 
-#define YM_VOLUME_MULTIPLIER 2
-#define YM_VOLUME_DIVIDER 3
+void ym_enable_zero_offset(ym2612_context *context, uint8_t enabled)
+{
+	if (enabled) {
+		context->zero_offset = 0x70;
+		context->volume_mult = 79;
+		context->volume_div = 120;
+	} else {
+		context->zero_offset = 0;
+		context->volume_mult = 2;
+		context->volume_div = 3;
+	}
+}
 #define YM_MOD_SHIFT 1
 
 #define CSM_MODE 0x80
@@ -470,8 +481,7 @@ void ym_run(ym2612_context * context, uint32_t to_cycle)
 				if (operator->mod_src[0]) {
 					mod = *operator->mod_src[0];
 					if (operator->mod_src[1]) {
-						mod += *
-						operator->mod_src[1];
+						mod += *operator->mod_src[1];
 					}
 					mod >>= YM_MOD_SHIFT;
 				}
@@ -508,7 +518,7 @@ void ym_run(ym2612_context * context, uint32_t to_cycle)
 			if (operator->am) {
 				uint16_t base_am = (context->lfo_am_step & 0x80 ? context->lfo_am_step : ~context->lfo_am_step) & 0x7E;
 				if (ams_shift[chan->ams] >= 0) {
-					env += base_am >> ams_shift[chan->ams];
+					env += (base_am >> ams_shift[chan->ams]) & MAX_ENVELOPE;
 				} else {
 					env += base_am << (-ams_shift[chan->ams]);
 				}
@@ -529,6 +539,8 @@ void ym_run(ym2612_context * context, uint32_t to_cycle)
 			}
 			if (op % 4 == 0) {
 				chan->op1_old = operator->output;
+			} else if (op % 4 == 2) {
+				chan->op2_old = operator->output;
 			}
 			operator->output = output;
 			//Update the channel output if we've updated all operators
@@ -549,7 +561,7 @@ void ym_run(ym2612_context * context, uint32_t to_cycle)
 					if (value & 0x2000) {
 						value |= 0xC000;
 					}
-					dfprintf(debug_file, "channel %d output: %d\n", channel, (value * YM_VOLUME_MULTIPLIER) / YM_VOLUME_DIVIDER);
+					dfprintf(debug_file, "channel %d output: %d\n", channel, (value * context->volume_mult) / context->volume_div);
 				}
 			}
 			//puts("operator update done");
@@ -571,14 +583,31 @@ void ym_run(ym2612_context * context, uint32_t to_cycle)
 						value |= 0xC000;
 					}
 				}
+				if (value >= 0) {
+					value += context->zero_offset;
+				} else {
+					value -= context->zero_offset;
+				}
 				if (context->channels[i].logfile) {
 					fwrite(&value, sizeof(value), 1, context->channels[i].logfile);
 				}
 				if (context->channels[i].lr & 0x80) {
-					left += (value * YM_VOLUME_MULTIPLIER) / YM_VOLUME_DIVIDER;
+					left += (value * context->volume_mult) / context->volume_div;
+				} else if (context->zero_offset) {
+					if (value >= 0) {
+						left += (context->zero_offset * context->volume_mult) / context->volume_div;
+					} else {
+						left -= (context->zero_offset * context->volume_mult) / context->volume_div;
+					}
 				}
 				if (context->channels[i].lr & 0x40) {
-					right += (value * YM_VOLUME_MULTIPLIER) / YM_VOLUME_DIVIDER;
+					right += (value * context->volume_mult) / context->volume_div;
+				} else if (context->zero_offset) {
+					if (value >= 0) {
+						right += (context->zero_offset * context->volume_mult) / context->volume_div;
+					} else {
+						right -= (context->zero_offset * context->volume_mult) / context->volume_div;
+					}
 				}
 			}
 			render_put_stereo_sample(context->audio, left, right);
@@ -671,6 +700,7 @@ static uint32_t ym_calc_phase_inc(ym2612_context * context, ym_operator * operat
 		inc = context->ch3_supp[index].fnum;
 		if (channel->pms) {
 			inc = inc * 2 + lfo_pm_table[(inc & 0x7F0) * 16 + channel->pms + context->lfo_pm_step];
+			inc &= 0xFFF;
 		}
 		if (!context->ch3_supp[index].block) {
 			inc >>= 1;
@@ -683,6 +713,7 @@ static uint32_t ym_calc_phase_inc(ym2612_context * context, ym_operator * operat
 		inc = channel->fnum;
 		if (channel->pms) {
 			inc = inc * 2 + lfo_pm_table[(inc & 0x7F0) * 16 + channel->pms + context->lfo_pm_step];
+			inc &= 0xFFF;
 		}
 		if (!channel->block) {
 			inc >>= 1;
@@ -839,7 +870,6 @@ void ym_data_write(ym2612_context * context, uint8_t value)
 				operator->rates[PHASE_ATTACK] = value & 0x1F;
 				break;
 			case REG_DECAY_AM:
-				//TODO: AM flag for LFO
 				operator->am = value & 0x80;
 				operator->rates[PHASE_DECAY] = value & 0x1F;
 				break;
@@ -900,6 +930,8 @@ void ym_data_write(ym2612_context * context, uint8_t value)
 				{
 				case 0:
 					//operator 3 modulated by operator 2
+					//this uses a special op2 result reg on HW, but that reg will have the most recent
+					//result from op2 when op3 starts executing
 					context->operators[channel*4+1].mod_src[0] = &context->operators[channel*4+2].output;
 					context->operators[channel*4+1].mod_src[1] = NULL;
 					
@@ -912,7 +944,11 @@ void ym_data_write(ym2612_context * context, uint8_t value)
 					break;
 				case 1:
 					//operator 3 modulated by operator 1+2
-					context->operators[channel*4+1].mod_src[0] = &context->operators[channel*4+0].output;
+					//op1 starts executing before this, but due to pipeline length the most current result is
+					//not available and instead the previous result is used
+					context->operators[channel*4+1].mod_src[0] = &context->channels[channel].op1_old;
+					//this uses a special op2 result reg on HW, but that reg will have the most recent
+					//result from op2 when op3 starts executing
 					context->operators[channel*4+1].mod_src[1] = &context->operators[channel*4+2].output;
 					
 					//operator 2 unmodulated
@@ -924,6 +960,8 @@ void ym_data_write(ym2612_context * context, uint8_t value)
 					break;
 				case 2:
 					//operator 3 modulated by operator 2
+					//this uses a special op2 result reg on HW, but that reg will have the most recent
+					//result from op2 when op3 starts executing
 					context->operators[channel*4+1].mod_src[0] = &context->operators[channel*4+2].output;
 					context->operators[channel*4+1].mod_src[1] = NULL;
 					
@@ -931,6 +969,8 @@ void ym_data_write(ym2612_context * context, uint8_t value)
 					context->operators[channel*4+2].mod_src[0] = NULL;
 					
 					//operator 4 modulated by operator 1+3
+					//this uses a special op1 result reg on HW, but that reg will have the most recent
+					//result from op1 when op4 starts executing
 					context->operators[channel*4+3].mod_src[0] = &context->operators[channel*4+0].output;
 					context->operators[channel*4+3].mod_src[1] = &context->operators[channel*4+1].output;
 					break;
@@ -943,7 +983,9 @@ void ym_data_write(ym2612_context * context, uint8_t value)
 					context->operators[channel*4+2].mod_src[0] = &context->operators[channel*4+0].output;
 					
 					//operator 4 modulated by operator 2+3
-					context->operators[channel*4+3].mod_src[0] = &context->operators[channel*4+2].output;
+					//op2 starts executing before this, but due to pipeline length the most current result is
+					//not available and instead the previous result is used
+					context->operators[channel*4+3].mod_src[0] = &context->channels[channel].op2_old;
 					context->operators[channel*4+3].mod_src[1] = &context->operators[channel*4+1].output;
 					break;
 				case 4:
@@ -960,13 +1002,17 @@ void ym_data_write(ym2612_context * context, uint8_t value)
 					break;
 				case 5:
 					//operator 3 modulated by operator 1
-					context->operators[channel*4+1].mod_src[0] = &context->operators[channel*4+0].output;
+					//op1 starts executing before this, but due to pipeline length the most current result is
+					//not available and instead the previous result is used
+					context->operators[channel*4+1].mod_src[0] = &context->channels[channel].op1_old;
 					context->operators[channel*4+1].mod_src[1] = NULL;
 					
 					//operator 2 modulated by operator 1
 					context->operators[channel*4+2].mod_src[0] = &context->operators[channel*4+0].output;
 					
 					//operator 4 modulated by operator 1
+					//this uses a special op1 result reg on HW, but that reg will have the most recent
+					//result from op1 when op4 starts executing
 					context->operators[channel*4+3].mod_src[0] = &context->operators[channel*4+0].output;
 					context->operators[channel*4+3].mod_src[1] = NULL;
 					break;

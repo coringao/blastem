@@ -1,28 +1,43 @@
+#disable built-in rules
+.SUFFIXES :
+
 ifndef OS
 OS:=$(shell uname -s)
 endif
 FIXUP:=true
 
-ifeq ($(OS),Windows)
-ifndef SDL2_PREFIX
-SDL2_PREFIX:="sdl/i686-w64-mingw32"
-endif
-ifndef GLEW_PREFIX
-GLEW_PREFIX:=glew
-endif
-ifndef GLEW32S_LIB
-GLEW32S_LIB:=$(GLEW_PREFIX)/lib/Release/Win32/glew32s.lib
-endif
+BUNDLED_LIBZ:=zlib/adler32.o zlib/compress.o zlib/crc32.o zlib/deflate.o zlib/gzclose.o zlib/gzlib.o zlib/gzread.o\
+	zlib/gzwrite.o zlib/infback.o zlib/inffast.o zlib/inflate.o zlib/inftrees.o zlib/trees.o zlib/uncompr.o zlib/zutil.o
 
+ifeq ($(OS),Windows)
+
+GLEW_PREFIX:=glew
 MEM:=mem_win.o
 TERMINAL:=terminal_win.o
 FONT:=nuklear_ui/font_win.o
 NET:=net_win.o
 EXE:=.exe
-CC:=i686-w64-mingw32-gcc-win32
-CFLAGS:=-std=gnu99 -Wreturn-type -Werror=return-type -Werror=implicit-function-declaration -I"$(SDL2_PREFIX)/include/SDL2" -I"$(GLEW_PREFIX)/include" -DGLEW_STATIC
-LDFLAGS:= $(GLEW32S_LIB) -L"$(SDL2_PREFIX)/lib" -lm -lmingw32 -lSDL2main -lSDL2 -lws2_32 -lopengl32 -lglu32 -mwindows
+SO:=dll
 CPU:=i686
+ifeq ($(CPU),i686)
+CC:=i686-w64-mingw32-gcc-win32
+WINDRES:=i686-w64-mingw32-windres
+GLUDIR:=Win32
+SDL2_PREFIX:="sdl/i686-w64-mingw32"
+else
+CC:=x86_64-w64-mingw32-gcc-win32
+WINDRES:=x86_64-w64-mingw32-windres
+SDL2_PREFIX:="sdl/x86_64-w64-mingw32"
+GLUDIR:=x64
+endif
+GLEW32S_LIB:=$(GLEW_PREFIX)/lib/Release/$(GLUDIR)/glew32s.lib
+CFLAGS:=-std=gnu99 -Wreturn-type -Werror=return-type -Werror=implicit-function-declaration
+LDFLAGS:=-lm -lmingw32 -lws2_32 -mwindows
+ifneq ($(MAKECMDGOALS),libblastem.dll)
+CFLAGS+= -I"$(SDL2_PREFIX)/include/SDL2" -I"$(GLEW_PREFIX)/include" -DGLEW_STATIC
+LDFLAGS+= $(GLEW32S_LIB) -L"$(SDL2_PREFIX)/lib" -lSDL2main -lSDL2 -lopengl32 -lglu32
+endif
+LIBZOBJS=$(BUNDLED_LIBZ)
 
 else
 
@@ -37,7 +52,9 @@ CFLAGS:=-std=gnu99 -Wreturn-type -Werror=return-type -Werror=implicit-function-d
 ifeq ($(OS),Darwin)
 LIBS=sdl2 glew
 FONT:=nuklear_ui/font_mac.o
+SO:=dylib
 else
+SO:=so
 
 ifdef USE_FBDEV
 LIBS=alsa
@@ -64,8 +81,7 @@ ifdef HOST_ZLIB
 LIBS+= zlib
 LIBZOBJS=
 else
-LIBZOBJS=zlib/adler32.o zlib/compress.o zlib/crc32.o zlib/deflate.o zlib/gzclose.o zlib/gzlib.o zlib/gzread.o\
-	zlib/gzwrite.o zlib/infback.o zlib/inffast.o zlib/inflate.o zlib/inftrees.o zlib/trees.o zlib/uncompr.o zlib/zutil.o
+LIBZOBJS=$(BUNDLED_LIBZ)
 endif
 
 ifeq ($(OS),Darwin)
@@ -96,7 +112,7 @@ endif
 endif #Darwin
 
 else
-ifeq ($(MAKECMDGOALS),libblastem.so)
+ifeq ($(MAKECMDGOALS),libblastem.$(SO))
 LDFLAGS:=-lm
 else
 CFLAGS:=$(shell pkg-config --cflags-only-I $(LIBS)) $(CFLAGS)
@@ -138,7 +154,6 @@ CFLAGS+= -g3
 endif
 ifdef NOGL
 CFLAGS+= -DDISABLE_OPENGL
-NONUKLEAR:=1
 endif
 
 ifdef M68030
@@ -204,9 +219,9 @@ MAINOBJS=blastem.o system.o genesis.o vdp.o $(RENDEROBJS) io.o romdb.o hash.o me
 	realtec.o i2c.o nor.o sega_mapper.o multi_game.o megawifi.o $(NET) serialize.o $(TERMINAL) $(CONFIGOBJS) \
 	$(M68KOBJS) $(TRANSOBJS) $(AUDIOOBJS) saves.o zip.o bindings.o jcart.o
 
-LIBOBJS=libblastem.o system.o genesis.o debug.o gdb_remote.o vdp.o io.o romdb.o hash.o menu.o xband.o realtec.o \
+LIBOBJS=libblastem.o system.o genesis.o debug.o gdb_remote.o vdp.o io.o romdb.o hash.o xband.o realtec.o \
 	i2c.o nor.o sega_mapper.o multi_game.o megawifi.o $(NET) serialize.o $(TERMINAL) $(CONFIGOBJS) gst.o \
-	$(M68KOBJS) $(TRANSOBJS) $(AUDIOOBJS) saves.o jcart.o
+	$(M68KOBJS) $(TRANSOBJS) $(AUDIOOBJS) saves.o jcart.o rom.db.o
 	
 ifdef NONUKLEAR
 CFLAGS+= -DDISABLE_NUKLEAR
@@ -250,13 +265,13 @@ ifneq ($(OS),Windows)
 ALL+= termhelper
 endif
 
-ifeq ($(MAKECMDGOALS),libblastem.so)
+ifeq ($(MAKECMDGOALS),libblastem.$(SO))
 CFLAGS+= -fpic -DIS_LIB
 endif
 
 all : $(ALL)
 
-libblastem.so : $(LIBOBJS)
+libblastem.$(SO) : $(LIBOBJS)
 	$(CC) -shared -o $@ $^ $(LDFLAGS)
 
 blastem$(EXE) : $(MAINOBJS)
@@ -264,6 +279,9 @@ blastem$(EXE) : $(MAINOBJS)
 	$(FIXUP) ./$@
 	
 blastjag$(EXE) : jaguar.o jag_video.o $(RENDEROBJS) serialize.o $(M68KOBJS) $(TRANSOBJS) $(CONFIGOBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+termhelper : termhelper.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 dis$(EXE) : dis.o 68kinst.o tern.o vos_program_module.o
@@ -328,6 +346,9 @@ vos_prog_info : vos_prog_info.o vos_program_module.o
 %.c : %.cpu cpu_dsl.py
 	./cpu_dsl.py -d goto $< > $@
 
+%.db.c : %.db
+	sed $< -e 's/"/\\"/g' -e 's/^\(.*\)$$/"\1\\n"/' -e'1s/^\(.*\)$$/const char $(shell echo $< | tr '.' '_')_data[] = \1/' -e '$$s/^\(.*\)$$/\1;/' > $@
+
 %.o : %.S
 	$(CC) -c -o $@ $<
 
@@ -349,7 +370,7 @@ vos_prog_info : vos_prog_info.o vos_program_module.o
 %.bin : %.sz8
 	vasmz80_mot -Fbin -spaces -o $@ $<
 res.o : blastem.rc
-	i686-w64-mingw32-windres blastem.rc res.o
+	$(WINDRES) blastem.rc res.o
 
 arrow.tiles : arrow.png
 cursor.tiles : cursor.png

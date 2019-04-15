@@ -477,13 +477,16 @@ void warning(char *format, ...)
 	va_end(args);
 }
 
+static uint8_t output_enabled = 1;
 void info_message(char *format, ...)
 {
 	va_list args;
 	va_start(args, format);
 #ifndef _WIN32
 	if (headless || (isatty(STDOUT_FILENO) && isatty(STDIN_FILENO))) {
-		info_printf(format, args);
+		if (output_enabled) {
+			info_printf(format, args);
+		}
 	} else {
 #endif
 		int32_t size = strlen(format) * 2;
@@ -503,13 +506,29 @@ void info_message(char *format, ...)
 			va_start(args, format);
 			vsnprintf(buf, actual, format, args);
 		}
-		info_puts(buf);
+		if (output_enabled) {
+			info_puts(buf);
+		}
 		render_infobox("BlastEm Info", buf);
 		free(buf);
 #ifndef _WIN32
 	}
 #endif
 	va_end(args);
+}
+
+void debug_message(char *format, ...)
+{
+	va_list args;
+	va_start(args, format);
+	if (output_enabled) {
+		info_printf(format, args);
+	}
+}
+
+void disable_stdout_messages(void)
+{
+	output_enabled = 0;
 }
 
 #ifdef _WIN32
@@ -838,6 +857,7 @@ void sort_dir_list(dir_entry *list, size_t num_entries)
 #ifdef __ANDROID__
 
 #include <SDL.h>
+#ifndef IS_LIB
 char *read_bundled_file(char *name, uint32_t *sizeret)
 {
 	SDL_RWops *rw = SDL_RWFromFile(name, "rb");
@@ -865,6 +885,7 @@ char *read_bundled_file(char *name, uint32_t *sizeret)
 	SDL_RWclose(rw);
 	return ret;
 }
+#endif
 
 char const *get_config_dir()
 {
@@ -878,6 +899,7 @@ char const *get_userdata_dir()
 
 #else
 
+#ifndef IS_LIB
 char *read_bundled_file(char *name, uint32_t *sizeret)
 {
 #ifdef DATA_PATH
@@ -921,7 +943,7 @@ char *read_bundled_file(char *name, uint32_t *sizeret)
 	fclose(f);
 	return ret;
 }
-
+#endif
 
 #ifdef _WIN32
 char const *get_userdata_dir()

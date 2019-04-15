@@ -39,6 +39,7 @@ typedef struct {
 	uint16_t fnum;
 	int16_t  output;
 	int16_t  op1_old;
+	int16_t  op2_old;
 	uint8_t  block_fnum_latch;
 	uint8_t  block;
 	uint8_t  keycode;
@@ -70,9 +71,11 @@ typedef struct {
 	//TODO: Condense the next two fields into one
 	uint32_t    write_cycle;
 	uint32_t    busy_cycles;
-	uint32_t    lowpass_alpha;
+	int32_t     volume_mult;
+	int32_t     volume_div;
 	ym_operator operators[NUM_OPERATORS];
 	ym_channel  channels[NUM_CHANNELS];
+	int16_t     zero_offset;
 	uint16_t    timer_a;
 	uint16_t    timer_a_load;
 	uint16_t    env_counter;
@@ -128,6 +131,7 @@ enum {
 void ym_init(ym2612_context * context, uint32_t master_clock, uint32_t clock_div, uint32_t options);
 void ym_reset(ym2612_context *context);
 void ym_free(ym2612_context *context);
+void ym_enable_zero_offset(ym2612_context *context, uint8_t enabled);
 void ym_adjust_master_clock(ym2612_context * context, uint32_t master_clock);
 void ym_run(ym2612_context * context, uint32_t to_cycle);
 void ym_address_write_part1(ym2612_context * context, uint8_t address);
