@@ -510,12 +510,6 @@ static inline void m68ki_write_32(m68000_base_device *m68k, uint32_t address, ui
 /* =============================== PROTOTYPES ============================= */
 /* ======================================================================== */
 
-union fp_reg
-{
-	uint64_t i;
-	double f;
-};
-
 void m68ki_exception_interrupt(m68000_base_device *m68k, uint32_t int_level);
 
 

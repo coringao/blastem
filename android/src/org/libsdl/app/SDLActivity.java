@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.Arrays;
 import java.lang.reflect.Method;
+import java.lang.NullPointerException;
 import java.util.Objects;
 
 import android.app.*;
@@ -195,7 +196,12 @@ public class SDLActivity extends Activity {
         SDL.setContext(this);
 
         if (Build.VERSION.SDK_INT >= 11) {
-            mClipboardHandler = new SDLClipboardHandler_API11();
+			try {
+				mClipboardHandler = new SDLClipboardHandler_API11();
+			} catch (NullPointerException e) {
+				//deal with shitty emulation boxes
+				mClipboardHandler = new SDLClipboardHandler_Old();
+			}
         } else {
             /* Before API 11, no clipboard notification (eg no SDL_CLIPBOARDUPDATE) */
             mClipboardHandler = new SDLClipboardHandler_Old();

@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <limits.h>
+#include <string.h>
 #include "../util.h"
 #include "../paths.h"
 #include "sfnt.h"
@@ -186,9 +187,9 @@ uint8_t *default_font(uint32_t *size_out)
 	}
 error:
 	//try some likely suspects if we failed to parse fonts.xml or failed to find the indicated font
-	ret = try_load_font("/system/fonts/Roboto-Regular.ttf", size_out);
+	ret = try_load_font(strdup("/system/fonts/Roboto-Regular.ttf"), size_out);
 	if (!ret) {
-		ret = try_load_font("/system/fonts/DroidSans.ttf", size_out);
+		ret = try_load_font(strdup("/system/fonts/DroidSans.ttf"), size_out);
 	}
 	return ret;
 }

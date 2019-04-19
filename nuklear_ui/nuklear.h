@@ -5557,23 +5557,35 @@ nk_murmur_hash(const void * key, int len, nk_hash seed)
 {
     /* 32-Bit MurmurHash3: https://code.google.com/p/smhasher/wiki/MurmurHash3*/
     #define NK_ROTL(x,r) ((x) << (r) | ((x) >> (32 - r)))
-    union {const nk_uint *i; const nk_byte *b;} conv = {0};
     const nk_byte *data = (const nk_byte*)key;
     const int nblocks = len/4;
     nk_uint h1 = seed;
     const nk_uint c1 = 0xcc9e2d51;
     const nk_uint c2 = 0x1b873593;
     const nk_byte *tail;
+#if defined(X86_32) || defined(X86_64)
     const nk_uint *blocks;
+#else
+	const nk_byte *blocks;
+#endif
     nk_uint k1;
     int i;
 
     /* body */
     if (!key) return 0;
-    conv.b = (data + nblocks*4);
-    blocks = (const nk_uint*)conv.i;
-    for (i = -nblocks; i; ++i) {
-        k1 = blocks[i];
+#if defined(X86_32) || defined(X86_64)
+    blocks = (const nk_uint*)(data + nblocks*4);
+	for (i = -nblocks; i; ++i) {
+		k1 = blocks[i];
+#else
+	blocks = data + nblocks*4;
+	for (i = -4 * nblocks; i; ++i) {
+		k1 = blocks[i++] << 24;
+		k1 |= blocks[i++] << 16;
+		k1 |= blocks[i++] << 8;
+		k1 |= blocks[i] << 16;
+#endif
+        
         k1 *= c1;
         k1 = NK_ROTL(k1,15);
         k1 *= c2;
