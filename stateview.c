@@ -113,7 +113,7 @@ int main(int argc, char ** argv)
 	height = height < 240 ? (width/320) * 240 : height;
 
 	render_init(width, height, "GST State Viewer", 0);
-	vdp_context *context = init_vdp_context(0);
+	vdp_context *context = init_vdp_context(0, 0);
 	vdp_load_gst(context, state_file);
 	vdp_run_to_vblank(context);
 	vdp_print_sprite_table(context);
@@ -122,6 +122,6 @@ int main(int argc, char ** argv)
 		puts("Forcing display on");
 		vdp_control_port_write(context, 0x8000 | REG_MODE_2 << 8 | context->regs[REG_MODE_2] | DISPLAY_ENABLE);
 	}
-    render_wait_quit(context);
+    render_wait_quit();
     return 0;
 }

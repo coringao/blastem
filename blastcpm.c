@@ -5,7 +5,7 @@
 #include <time.h>
 #include <sys/select.h>
 
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 #include "z80_to_x86.h"
 #else
 #include "z80.h"
@@ -19,7 +19,7 @@ uint8_t ram[64 * 1024];
 #define OS_RESET 0xE403
 int headless = 1;
 
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 void z80_next_int_pulse(z80_context * context)
 {
 	context->int_pulse_start = context->int_pulse_end = CYCLE_NEVER;
@@ -68,7 +68,7 @@ void *exit_write(uint32_t address, void *context, uint8_t value)
 {
 	time_t duration = time(NULL) - start;
 	z80_context *z80 = context;
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	total_cycles += context->current_cycle;
 #else
 	total_cycles += z80->cycles;
@@ -124,7 +124,7 @@ int main(int argc, char **argv)
 	for(;;)
 	{
 		z80_run(context, 1000000);
-#ifdef USE_NATIVE		
+#ifndef NEW_CORE		
 		total_cycles += context->current_cycle;
 		context->current_cycle = 0;
 #else

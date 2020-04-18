@@ -50,12 +50,14 @@ static void push_view(view_fun new_view)
 	}
 	previous_views[num_prev++] = current_view;
 	current_view = new_view;
+	context->input.selected_widget = 0;
 }
 
 static void pop_view()
 {
 	if (num_prev) {
 		current_view = previous_views[--num_prev];
+		context->input.selected_widget = 0;
 	}
 }
 
@@ -439,11 +441,11 @@ void view_key_bindings(struct nk_context *context)
 	};
 	const char *general_binds[] = {
 		"ui.exit", "ui.save_state", "ui.toggle_fullscreen", "ui.soft_reset", "ui.reload",
-		"ui.screenshot", "ui.sms_pause", "ui.toggle_keyboard_cpatured", "ui.release_mouse"
+		"ui.screenshot", "ui.vgm_log", "ui.sms_pause", "ui.toggle_keyboard_cpatured", "ui.release_mouse"
 	};
 	const char *general_names[] = {
 		"Show Menu", "Quick Save", "Toggle Fullscreen", "Soft Reset", "Reload Media",
-		"Internal Screenshot", "SMS Pause", "Capture Keyboard", "Release Mouse"
+		"Internal Screenshot", "Toggle VGM Log", "SMS Pause", "Capture Keyboard", "Release Mouse"
 	};
 	const char *speed_binds[] = {
 		"ui.next_speed", "ui.prev_speed",
@@ -590,6 +592,7 @@ const char *translate_binding_option(const char *option)
 		conf_names = tern_insert_ptr(conf_names, "ui.vdp_debug_pal", "VDP Debug Palette");
 		conf_names = tern_insert_ptr(conf_names, "ui.enter_debugger", "Enter CPU Debugger");
 		conf_names = tern_insert_ptr(conf_names, "ui.screenshot", "Take Screenshot");
+		conf_names = tern_insert_ptr(conf_names, "ui.vgm_log", "Toggle VGM Log");
 		conf_names = tern_insert_ptr(conf_names, "ui.exit", "Show Menu");
 		conf_names = tern_insert_ptr(conf_names, "ui.save_state", "Quick Save");
 		conf_names = tern_insert_ptr(conf_names, "ui.set_speed.0", "Set Speed 0");
@@ -1173,6 +1176,7 @@ static void start_mapping(void)
 	mapping_string[mapping_pos++] = ':';
 }
 
+static uint8_t initial_controller_config;
 #define QUIET_FRAMES 9
 static void view_controller_mappings(struct nk_context *context)
 {
@@ -1275,8 +1279,10 @@ static void view_controller_mappings(struct nk_context *context)
 					save_controller_mapping(selected_controller, mapping_string);
 					free(mapping_string);
 					pop_view();
-					push_view(view_controller_bindings);
-					controller_binding_changed = 0;
+					if (initial_controller_config) {
+						push_view(view_controller_bindings);
+						controller_binding_changed = 0;
+					}
 					added_mapping = 0;
 				} else if (get_axis_label(&selected_controller_info, current_axis)) {
 					added_mapping = 0;
@@ -1288,6 +1294,31 @@ static void view_controller_mappings(struct nk_context *context)
 		axis_moved = -1;
 		nk_end(context);
 	}
+}
+
+static void show_mapping_view(void)
+{
+	current_button = SDL_CONTROLLER_BUTTON_A;
+	button_pressed = -1;
+	last_button = -1;
+	last_hat = -1;
+	axis_moved = -1;
+	last_axis = -1;
+	last_axis_value = 0;
+	SDL_Joystick *joy = render_get_joystick(selected_controller);
+	const char *name = SDL_JoystickName(joy);
+	size_t namesz = strlen(name);
+	mapping_string = malloc(512 + namesz);
+	for (mapping_pos = 0; mapping_pos < namesz; mapping_pos++)
+	{
+		char c = name[mapping_pos];
+		if (c == ',' || c == '\n' || c == '\r') {
+			c = ' ';
+		}
+		mapping_string[mapping_pos] = c;
+	}
+	
+	push_view(view_controller_mappings);
 }
 
 static void view_controller_variant(struct nk_context *context)
@@ -1325,33 +1356,15 @@ static void view_controller_variant(struct nk_context *context)
 	if (selected) {
 		save_controller_info(selected_controller, &selected_controller_info);
 		pop_view();
-		SDL_GameController *controller = render_get_controller(selected_controller);
-		if (controller) {
-			push_view(view_controller_bindings);
-			controller_binding_changed = 0;
-			SDL_GameControllerClose(controller);
-		} else {
-			current_button = SDL_CONTROLLER_BUTTON_A;
-			button_pressed = -1;
-			last_button = -1;
-			last_hat = -1;
-			axis_moved = -1;
-			last_axis = -1;
-			last_axis_value = 0;
-			SDL_Joystick *joy = render_get_joystick(selected_controller);
-			const char *name = SDL_JoystickName(joy);
-			size_t namesz = strlen(name);
-			mapping_string = malloc(512 + namesz);
-			for (mapping_pos = 0; mapping_pos < namesz; mapping_pos++)
-			{
-				char c = name[mapping_pos];
-				if (c == ',' || c == '\n' || c == '\r') {
-					c = ' ';
-				}
-				mapping_string[mapping_pos] = c;
+		if (initial_controller_config) {
+			SDL_GameController *controller = render_get_controller(selected_controller);
+			if (controller) {
+				push_view(view_controller_bindings);
+				controller_binding_changed = 0;
+				SDL_GameControllerClose(controller);
+			} else {
+				show_mapping_view();
 			}
-			
-			push_view(view_controller_mappings);
 		}
 	}
 }
@@ -1396,35 +1409,84 @@ void view_controller_type(struct nk_context *context)
 void view_controllers(struct nk_context *context)
 {
 	if (nk_begin(context, "Controllers", nk_rect(0, 0, render_width(), render_height()), NK_WINDOW_NO_SCROLLBAR)) {
-		int height = (render_width() - 2*context->style.font->height) / MAX_JOYSTICKS;
+		int height = (render_height() - 2*context->style.font->height) / 5;
+		int inner_height = height - context->style.window.spacing.y;
+		const struct nk_user_font *font = context->style.font;
+		int bindings_width = font->width(font->userdata, font->height, "Bindings", strlen("Bindings")) + context->style.button.padding.x * 2;
+		int remap_width = font->width(font->userdata, font->height, "Remap", strlen("Remap")) + context->style.button.padding.x * 2;
+		int change_type_width = font->width(font->userdata, font->height, "Change Type", strlen("Change Type")) + context->style.button.padding.x * 2;
+		int total = bindings_width + remap_width + change_type_width;
+		float bindings_ratio = (float)bindings_width / total;
+		float remap_ratio = (float)remap_width / total;
+		float change_type_ratio = (float)change_type_width / total;
+		
+		
+		uint8_t found_controller = 0;
 		for (int i = 0; i < MAX_JOYSTICKS; i++)
 		{
 			SDL_Joystick *joy = render_get_joystick(i);
 			if (joy) {
+				found_controller = 1;
 				controller_info info = get_controller_info(i);
 				ui_image *controller_image = select_best_image(&info);
-				int image_width = height * controller_image->width / controller_image->height;
-				nk_layout_row_begin(context, NK_STATIC, height, 2);
-				nk_layout_row_push(context, image_width);
+				int image_width = inner_height * controller_image->width / controller_image->height;
+				nk_layout_space_begin(context, NK_STATIC, height, INT_MAX);
+				nk_layout_space_push(context, nk_rect(context->style.font->height / 2, 0, image_width, inner_height));
 				if (info.type == TYPE_UNKNOWN || info.type == TYPE_GENERIC_MAPPING) {
 					nk_label(context, "?", NK_TEXT_CENTERED);
 				} else {
 					nk_image(context, controller_image->ui);
 				}
-				nk_layout_row_push(context, render_width() - image_width - 2 * context->style.font->height);
-				if (nk_button_label(context, info.name)) {
-					selected_controller = i;
-					selected_controller_info = info;
-					if (info.type == TYPE_UNKNOWN || info.type == TYPE_GENERIC_MAPPING) {
+				int button_start = image_width + context->style.font->height;
+				int button_area_width = render_width() - image_width - 2 * context->style.font->height;
+				
+				nk_layout_space_push(context, nk_rect(button_start, 0, button_area_width, inner_height/2));
+				nk_label(context, info.name, NK_TEXT_CENTERED);
+				const struct nk_user_font *font = context->style.font;
+				if (info.type == TYPE_UNKNOWN || info.type == TYPE_GENERIC_MAPPING) {
+					int button_width = font->width(font->userdata, font->height, "Configure", strlen("Configure"));
+					nk_layout_space_push(context, nk_rect(button_start, height/2, button_width, inner_height/2));
+					if (nk_button_label(context, "Configure")) {
+						selected_controller = i;
+						selected_controller_info = info;
+						initial_controller_config = 1;
 						push_view(view_controller_type);
-					} else {
+					}
+				} else {
+					button_area_width -= 2 * context->style.window.spacing.x;
+					bindings_width = bindings_ratio * button_area_width;
+					nk_layout_space_push(context, nk_rect(button_start, height/2, bindings_width, inner_height/2));
+					if (nk_button_label(context, "Bindings")) {
+						selected_controller = i;
+						selected_controller_info = info;
 						push_view(view_controller_bindings);
 						controller_binding_changed = 0;
 					}
-					
+					button_start += bindings_width + context->style.window.spacing.x;
+					remap_width = remap_ratio * button_area_width;
+					nk_layout_space_push(context, nk_rect(button_start, height/2, remap_width, inner_height/2));
+					if (nk_button_label(context, "Remap")) {
+						selected_controller = i;
+						selected_controller_info = info;
+						initial_controller_config = 0;
+						show_mapping_view();
+					}
+					button_start += remap_width + context->style.window.spacing.x;
+					change_type_width = change_type_ratio * button_area_width;
+					nk_layout_space_push(context, nk_rect(button_start, height/2, change_type_width, inner_height/2));
+					if (nk_button_label(context, "Change Type")) {
+						selected_controller = i;
+						selected_controller_info = info;
+						initial_controller_config = 0;
+						push_view(view_controller_type);
+					}
 				}
-				nk_layout_row_end(context);
+				//nk_layout_row_end(context);
 			}
+		}
+		if (!found_controller) {
+			nk_layout_row_static(context, context->style.font->height, render_width() - 2 * context->style.font->height, 1);
+			nk_label(context, "No controllers detected", NK_TEXT_CENTERED);
 		}
 		nk_layout_row_static(context, context->style.font->height, (render_width() - 2 * context->style.font->height) / 2, 2);
 		nk_label(context, "", NK_TEXT_LEFT);
@@ -1464,6 +1526,24 @@ void settings_int_input(struct nk_context *context, char *label, char *path, cha
 		config_dirty = 1;
 		config = tern_insert_path(config, path, (tern_val){.ptrval = strdup(buffer)}, TVAL_PTR);
 	}
+}
+
+void settings_string(struct nk_context *context, char *label, char *path, char *def)
+{
+	nk_label(context, label, NK_TEXT_LEFT);
+	char *curstr = tern_find_path_default(config, path, (tern_val){.ptrval = def}, TVAL_PTR).ptrval;
+	uint32_t len = strlen(curstr);
+	uint32_t buffer_len = len > 100 ? len + 1 : 101;
+	char *buffer = malloc(buffer_len);
+	memcpy(buffer, curstr, len);
+	memset(buffer+len, 0, buffer_len-len);
+	nk_edit_string(context, NK_EDIT_SIMPLE, buffer, &len, buffer_len-1, nk_filter_default);
+	buffer[len] = 0;
+	if (strcmp(buffer, curstr)) {
+		config_dirty = 1;
+		config = tern_insert_path(config, path, (tern_val){.ptrval = strdup(buffer)}, TVAL_PTR);
+	}
+	free(buffer);
 }
 
 void settings_int_property(struct nk_context *context, char *label, char *name, char *path, int def, int min, int max)
@@ -1524,7 +1604,7 @@ shader_prog *get_shader_progs(dir_entry *entries, size_t num_entries, shader_pro
 			if (!dupe) {
 				if (num_progs == prog_storage) {
 					prog_storage = prog_storage ? prog_storage*2 : 4;
-					progs = realloc(progs, sizeof(progs) * prog_storage);
+					progs = realloc(progs, sizeof(*progs) * prog_storage);
 				}
 				progs[num_progs].vertex = NULL;
 				progs[num_progs++].fragment = strdup(entries[i].name); 
@@ -1576,6 +1656,7 @@ shader_prog *get_shader_list(uint32_t *num_out)
 	shader_dir = path_append(get_exe_dir(), "shaders");
 #endif
 	entries = get_dir_list(shader_dir, &num_entries);
+	free(shader_dir);
 	progs = get_shader_progs(entries, num_entries, progs, &num_progs, &prog_storage);
 	*num_out = num_progs;
 	return progs;
@@ -1751,6 +1832,50 @@ void view_audio_settings(struct nk_context *context)
 		nk_end(context);
 	}
 }
+typedef struct {
+	const char **models;
+	const char **names;
+	uint32_t   num_models;
+	uint32_t   storage;
+} model_foreach_state;
+void model_iter(char *key, tern_val val, uint8_t valtype, void *data)
+{
+	if (valtype != TVAL_NODE) {
+		return;
+	}
+	model_foreach_state *state = data;
+	if (state->num_models == state->storage) {
+		state->storage *= 2;
+		state->models = realloc(state->models, state->storage * sizeof(char *));
+		state->names = realloc(state->names, state->storage * sizeof(char *));
+	}
+	char *def = strdup(key);
+	state->models[state->num_models] = def;
+	state->names[state->num_models++] = tern_find_ptr_default(val.ptrval, "name", def);
+}
+
+typedef struct {
+	const char **models;
+	const char **names;
+} models;
+
+models get_models(uint32_t *num_out)
+{
+	tern_node *systems = get_systems_config();
+	model_foreach_state state = {
+		.models = calloc(4, sizeof(char *)),
+		.names = calloc(4, sizeof(char *)),
+		.num_models = 0,
+		.storage = 4
+	};
+	tern_foreach(systems, model_iter, &state);
+	*num_out = state.num_models;
+	return (models){
+		.models = state.models,
+		.names = state.names
+	};
+}
+
 void view_system_settings(struct nk_context *context)
 {
 	const char *sync_opts[] = {
@@ -1773,12 +1898,25 @@ void view_system_settings(struct nk_context *context)
 	if (selected_region < 0) {
 		selected_region = find_match(region_codes, num_regions, "system\0default_region\0", "U");
 	}
+	static const char **model_opts;
+	static const char **model_names;
+	static uint32_t num_models;
+	if (!model_opts) {
+		models m = get_models(&num_models);
+		model_opts = m.models;
+		model_names = m.names;
+	}
+	static int32_t selected_model = -1;
+	if (selected_model < 0) {
+		selected_model = find_match(model_opts, num_models, "system\0model\0", "md1va3");
+	}
+	
 	const char *formats[] = {
 		"native",
 		"gst"
 	};
 	const uint32_t num_formats = sizeof(formats)/sizeof(*formats);
-	int32_t selected_format = -1;
+	static int32_t selected_format = -1;
 	if (selected_format < 0) {
 		selected_format = find_match(formats, num_formats, "ui\0state_format\0", "native");
 	}
@@ -1825,7 +1963,10 @@ void view_system_settings(struct nk_context *context)
 		selected_sync = settings_dropdown(context, "Sync Source", sync_opts, num_sync_opts, selected_sync, "system\0sync_source\0");
 		settings_int_property(context, "68000 Clock Divider", "", "clocks\0m68k_divider\0", 7, 1, 53);
 		settings_toggle(context, "Remember ROM Path", "ui\0remember_path\0", 1);
+		settings_toggle(context, "Save config with EXE", "ui\0config_in_exe_dir\0", 0);
+		settings_string(context, "Game Save Path", "ui\0save_path\0", "$USERDATA/blastem/$ROMNAME");
 		selected_region = settings_dropdown_ex(context, "Default Region", region_codes, regions, num_regions, selected_region, "system\0default_region\0");
+		selected_model = settings_dropdown_ex(context, "Model", model_opts, model_names, num_models, selected_model, "system\0model\0");
 		selected_format = settings_dropdown(context, "Save State Format", formats, num_formats, selected_format, "ui\0state_format\0");
 		selected_init = settings_dropdown(context, "Initial RAM Value", ram_inits, num_inits, selected_init, "system\0ram_init\0");
 		selected_io_1 = settings_dropdown_ex(context, "IO Port 1 Device", io_opts_1, device_type_names, num_io, selected_io_1, "io\0devices\0""1\0");
@@ -1919,6 +2060,7 @@ void blastem_nuklear_render(void)
 
 void ui_idle_loop(void)
 {
+	render_enable_gamepad_events(1);
 	const uint32_t MIN_UI_DELAY = 15;
 	static uint32_t last;
 	while (current_view != view_play)
@@ -1935,6 +2077,7 @@ void ui_idle_loop(void)
 		persist_config(config);
 		config_dirty = 0;
 	}
+	render_enable_gamepad_events(0);
 }
 static void handle_event(SDL_Event *event)
 {
@@ -2054,6 +2197,11 @@ static void style_init(void)
 		.r = 255, .g = 128, .b = 0, .a = 255
 	};
 	context->style.checkbox.cursor_hover = context->style.checkbox.cursor_normal;
+	context->style.property.inc_button.text_hover = (struct nk_color){
+		.r = 255, .g = 128, .b = 0, .a = 255
+	};
+	context->style.property.dec_button.text_hover = context->style.property.inc_button.text_hover;
+	context->style.combo.button.text_hover = context->style.property.inc_button.text_hover;
 }
 
 static void context_created(void)
@@ -2071,6 +2219,7 @@ void show_pause_menu(void)
 		context->style.window.background = nk_rgba(0, 0, 0, 128);
 		context->style.window.fixed_background = nk_style_item_color(nk_rgba(0, 0, 0, 128));
 		current_view = view_pause;
+		context->input.selected_widget = 0;
 		current_system->request_exit(current_system);
 	} else if (current_system && !set_binding) {
 		clear_view_stack();
@@ -2082,6 +2231,7 @@ void show_play_view(void)
 {
 	set_content_binding_state(1);
 	current_view = view_play;
+	context->input.selected_widget = 0;
 }
 
 static uint8_t active;

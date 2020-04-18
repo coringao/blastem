@@ -6,7 +6,7 @@
 #include "backend.h"
 #include <stdlib.h>
 
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 deferred_addr * defer_address(deferred_addr * old_head, uint32_t address, uint8_t *dest)
 {
 	deferred_addr * new_head = malloc(sizeof(deferred_addr));

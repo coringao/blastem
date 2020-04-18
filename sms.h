@@ -4,7 +4,7 @@
 #include "system.h"
 #include "vdp.h"
 #include "psg.h"
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 #include "z80_to_x86.h"
 #else
 #include "z80.h"

@@ -4,17 +4,17 @@
  BlastEm is free software distributed under the terms of the GNU General Public License version 3 or greater. See COPYING for full license text.
 */
 #include "m68k_core.h"
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 #include "m68k_internal.h"
 #endif
 #include "68kinst.h"
 #include "backend.h"
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 #include "gen.h"
 #endif
 #include "util.h"
 #include "serialize.h"
-#ifndef USE_NATIVE
+#ifdef NEW_CORE
 #include "musashi/m68kcpu.h"
 #endif
 #include <stdio.h>
@@ -23,7 +23,7 @@
 #include <string.h>
 
 char disasm_buf[1024];
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 int8_t native_reg(m68k_op_info * op, m68k_options * opts)
 {
 	if (op->addr_mode == MODE_REG) {
@@ -61,7 +61,7 @@ void m68k_print_regs(m68k_context * context)
 		printf("a%d: %X\n", i, context->aregs[i]);
 	}
 }
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 void m68k_read_size(m68k_options *opts, uint8_t size)
 {
 	switch (size)
@@ -779,7 +779,7 @@ uint8_t m68k_is_terminal(m68kinst * inst)
 		|| (inst->op == M68K_BCC && inst->extra.cond == COND_TRUE);
 }
 
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 static void m68k_handle_deferred(m68k_context * context)
 {
 	m68k_options * opts = context->options;
@@ -792,7 +792,7 @@ static void m68k_handle_deferred(m68k_context * context)
 
 uint16_t m68k_get_ir(m68k_context *context)
 {
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	uint32_t inst_addr = get_instruction_start(context->options, context->last_prefetch_address-2);
 	uint16_t *native_addr = get_native_pointer(inst_addr, (void **)context->mem_pointers, &context->options->gen);
 	if (native_addr) {
@@ -830,7 +830,7 @@ void insert_breakpoint(m68k_context * context, uint32_t address, m68k_debug_hand
 			.handler = bp_handler,
 			.address = address
 		};
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 		m68k_breakpoint_patch(context, address, bp_handler, NULL);
 #endif
 	}
@@ -850,7 +850,7 @@ m68k_context *m68k_bp_dispatcher(m68k_context *context, uint32_t address)
 	return context;
 }
 
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 typedef enum {
 	RAW_FUNC = 1,
 	BINARY_ARITH,
@@ -1175,7 +1175,7 @@ void remove_breakpoint(m68k_context * context, uint32_t address)
 			break;
 		}
 	}
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	code_ptr native = get_native_address(context->options, address);
 	if (!native) {
 		return;
@@ -1192,7 +1192,7 @@ m68k_context * sync_components(m68k_context * context, uint32_t address);
 void start_68k_context(m68k_context * context, uint32_t address)
 {
 	m68k_options * options = context->options;
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	code_ptr addr = get_native_address_trans(context, address);
 	options->start_context(addr, context);
 #else
@@ -1210,7 +1210,7 @@ void start_68k_context(m68k_context * context, uint32_t address)
 
 void resume_68k(m68k_context *context)
 {
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	code_ptr addr = context->resume_pc;
 	context->resume_pc = NULL;
 	m68k_options * options = context->options;
@@ -1223,7 +1223,7 @@ void resume_68k(m68k_context *context)
 
 void m68k_reset(m68k_context * context)
 {
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	//TODO: Actually execute the M68K reset vector rather than simulating some of its behavior
 	uint16_t *reset_vec = get_native_pointer(0, (void **)context->mem_pointers, &context->options->gen);
 	context->aregs[7] = reset_vec[0] << 16 | reset_vec[1];
@@ -1237,7 +1237,7 @@ void m68k_reset(m68k_context * context)
 
 void m68k_options_free(m68k_options *opts)
 {
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	for (uint32_t address = 0; address < opts->gen.address_mask; address += NATIVE_CHUNK_SIZE)
 	{
 		uint32_t chunk = address / NATIVE_CHUNK_SIZE;
@@ -1257,7 +1257,7 @@ void m68k_options_free(m68k_options *opts)
 	free(opts);
 }
 
-#ifndef USE_NATIVE
+#ifdef NEW_CORE
 void init_m68k_opts(m68k_options * opts, memmap_chunk * memmap, uint32_t num_chunks, uint32_t clock_divider)
 {
 	memset(opts, 0, sizeof(*opts));
@@ -1273,7 +1273,7 @@ void init_m68k_opts(m68k_options * opts, memmap_chunk * memmap, uint32_t num_chu
 
 m68k_context * init_68k_context(m68k_options * opts, m68k_reset_handler reset_handler)
 {
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	m68k_context * context = calloc(1, sizeof(m68k_context) + ram_size(&opts->gen) / (1 << opts->gen.ram_flags_shift) / 8);
 	context->options = opts;
 #else
@@ -1301,7 +1301,7 @@ void m68k_serialize(m68k_context *context, uint32_t pc, serialize_buffer *buf)
 	{
 		save_int32(buf, context->aregs[i]);
 	}
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	save_int32(buf, pc);
 	uint16_t sr = context->status << 3;
 	for (int flag = 4; flag >= 0; flag--) {
@@ -1332,7 +1332,7 @@ void m68k_deserialize(deserialize_buffer *buf, void *vcontext)
 	{
 		context->aregs[i] = load_int32(buf);
 	}
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	//hack until both PC and IR registers are represented properly
 	context->last_prefetch_address = load_int32(buf);
 	uint16_t sr = load_int16(buf);
@@ -1354,7 +1354,7 @@ void m68k_deserialize(deserialize_buffer *buf, void *vcontext)
 	context->trace_pending = load_int8(buf);
 }
 
-#ifndef USE_NATIVE
+#ifdef NEW_CORE
 void m68k_invalidate_code_range(m68k_context *context, uint32_t start, uint32_t end)
 {
 	m68000_base_device *device = (m68000_base_device *)context;

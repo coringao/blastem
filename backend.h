@@ -8,7 +8,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 #include "gen.h"
 #else
 typedef uint8_t * code_ptr;
@@ -54,14 +54,14 @@ typedef struct deferred_addr {
 
 typedef struct {
 	uint32_t flags;
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	native_map_slot    *native_code_map;
 	deferred_addr      *deferred;
 	code_info          code;
 	uint8_t            **ram_inst_sizes;
 #endif	
 	memmap_chunk const *memmap;
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	code_ptr           save_context;
 	code_ptr           load_context;
 	code_ptr           handle_cycle_limit;
@@ -76,7 +76,7 @@ typedef struct {
 	uint32_t           max_address;
 	uint32_t           bus_cycles;
 	uint32_t           clock_divider;
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	uint32_t           move_pc_off;
 	uint32_t           move_pc_size;
 	int32_t            mem_ptr_off;
@@ -85,7 +85,7 @@ typedef struct {
 #endif
 	uint8_t            address_size;
 	uint8_t            byte_swap;
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	int8_t             context_reg;
 	int8_t             cycles;
 	int8_t             limit;
@@ -95,7 +95,7 @@ typedef struct {
 #endif
 } cpu_options;
 
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 typedef uint8_t * (*native_addr_func)(void * context, uint32_t address);
 
 deferred_addr * defer_address(deferred_addr * old_head, uint32_t address, uint8_t *dest);

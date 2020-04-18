@@ -9,7 +9,7 @@
 #include "saves.h"
 #include "bindings.h"
 
-#ifndef USE_NATIVE
+#ifdef NEW_CORE
 #define Z80_CYCLE cycles
 #define Z80_OPTS opts
 #define z80_handle_code_write(...)
@@ -70,7 +70,7 @@ static void update_interrupts(sms_context *sms)
 {
 	uint32_t vint = vdp_next_vint(sms->vdp);
 	uint32_t hint = vdp_next_hint(sms->vdp);
-#ifndef USE_NATIVE
+#ifdef NEW_CORE
 	sms->z80->int_cycle = vint < hint ? vint : hint;
 	z80_sync_cycle(sms->z80, sms->z80->sync_cycle);
 #else
@@ -357,7 +357,7 @@ static uint8_t load_state(system_header *system, uint8_t slot)
 	sms_context *sms = (sms_context *)system;
 	char *statepath = get_slot_name(system, slot, "state");
 	uint8_t ret;
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	if (!sms->z80->native_pc) {
 		ret = get_modification_time(statepath) != 0;
 		if (ret) {
@@ -381,7 +381,7 @@ static void run_sms(system_header *system)
 	render_set_video_standard(VID_NTSC);
 	while (!sms->should_return)
 	{
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 		if (system->delayed_load_slot) {
 			load_state(system, system->delayed_load_slot - 1);
 			system->delayed_load_slot = 0;
@@ -408,7 +408,7 @@ static void run_sms(system_header *system)
 		vdp_run_context(sms->vdp, target_cycle);
 		psg_run(sms->psg, target_cycle);
 		
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 		if (system->save_state) {
 			while (!sms->z80->pc) {
 				//advance Z80 to an instruction boundary
@@ -460,7 +460,7 @@ static void start_sms(system_header *system, char *statefile)
 		load_state_path(sms, statefile);
 	}
 	
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	if (system->enter_debugger) {
 		system->enter_debugger = 0;
 		zinsert_breakpoint(sms->z80, sms->z80->pc, (uint8_t *)zdebugger);
@@ -474,7 +474,7 @@ static void soft_reset(system_header *system)
 {
 	sms_context *sms = (sms_context *)system;
 	z80_assert_reset(sms->z80, sms->z80->Z80_CYCLE);
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	sms->z80->target_cycle = sms->z80->sync_cycle = sms->z80->current_cycle;
 #endif
 }
@@ -498,7 +498,7 @@ static void request_exit(system_header *system)
 {
 	sms_context *sms = (sms_context *)system;
 	sms->should_return = 1;
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	sms->z80->target_cycle = sms->z80->sync_cycle = sms->z80->Z80_CYCLE;
 #endif
 }
@@ -633,7 +633,7 @@ sms_context *alloc_configure_sms(system_media *media, uint32_t opts, uint8_t for
 	
 	set_gain_config(sms);
 	
-	sms->vdp = init_vdp_context(0);
+	sms->vdp = init_vdp_context(0, 0);
 	sms->vdp->system = &sms->header;
 	
 	sms->header.info.save_type = SAVE_NONE;

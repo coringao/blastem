@@ -18,6 +18,7 @@
 #include "saves.h"
 #include "bindings.h"
 #include "jcart.h"
+#include "config.h"
 #define MCLKS_NTSC 53693175
 #define MCLKS_PAL  53203395
 
@@ -34,12 +35,12 @@ uint32_t MCLKS_PER_68K;
 #define LINES_PAL 313
 
 #ifdef IS_LIB
-#define MAX_SOUND_CYCLES 1000
+#define MAX_SOUND_CYCLES (MCLKS_PER_YM*NUM_OPERATORS*6*4)
 #else
 #define MAX_SOUND_CYCLES 100000	
 #endif
 
-#ifndef USE_NATIVE
+#ifdef NEW_CORE
 #define Z80_CYCLE cycles
 #define Z80_OPTS opts
 #define z80_handle_code_write(...)
@@ -199,7 +200,7 @@ static void deserialize(system_header *sys, uint8_t *data, size_t size)
 	deserialize_buffer buffer;
 	init_deserialize(&buffer, data, size);
 	genesis_deserialize(&buffer, gen);
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	//HACK: Fix this once PC/IR is represented in a better way in 68K core
 	gen->m68k->resume_pc = get_native_address_trans(gen->m68k, gen->m68k->last_prefetch_address);
 #endif
@@ -220,7 +221,7 @@ uint16_t read_dma_value(uint32_t address)
 static uint16_t get_open_bus_value(system_header *system)
 {
 	genesis_context *genesis = (genesis_context *)system;
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	return read_dma_value(genesis->m68k->last_prefetch_address/2);
 #else
 	m68000_base_device *device = (m68000_base_device *)genesis->m68k;
@@ -305,7 +306,7 @@ static void adjust_int_cycle(m68k_context * context, vdp_context * v_context)
 static void z80_next_int_pulse(z80_context * z_context)
 {
 	genesis_context * gen = z_context->system;
-#ifndef USE_NATIVE
+#ifdef NEW_CORE
 	z_context->int_cycle = vdp_next_vint_z80(gen->vdp);
 	z_context->int_end_cycle = z_context->int_cycle + Z80_INT_PULSE_MCLKS;
 	z_context->int_value = 0xFF;
@@ -321,7 +322,7 @@ static void sync_z80(z80_context * z_context, uint32_t mclks)
 {
 #ifndef NO_Z80
 	if (z80_enabled) {
-#ifndef USE_NATIVE
+#ifdef NEW_CORE
 		if (z_context->int_cycle == 0xFFFFFFFFU) {
 			z80_next_int_pulse(z_context);
 		}
@@ -373,12 +374,12 @@ m68k_context * sync_components(m68k_context * context, uint32_t address)
 	z80_context * z_context = gen->z80;
 #ifdef REFRESH_EMULATION
 	if (context->current_cycle != last_sync_cycle) {
-		//lame estimation of refresh cycle delay
-		refresh_counter += context->current_cycle - last_sync_cycle;
-		if (!gen->bus_busy) {
-			context->current_cycle += REFRESH_DELAY * MCLKS_PER_68K * (refresh_counter / (MCLKS_PER_68K * REFRESH_INTERVAL));
-		}
-		refresh_counter = refresh_counter % (MCLKS_PER_68K * REFRESH_INTERVAL);
+	//lame estimation of refresh cycle delay
+	refresh_counter += context->current_cycle - last_sync_cycle;
+	if (!gen->bus_busy) {
+		context->current_cycle += REFRESH_DELAY * MCLKS_PER_68K * (refresh_counter / (MCLKS_PER_68K * REFRESH_INTERVAL));
+	}
+	refresh_counter = refresh_counter % (MCLKS_PER_68K * REFRESH_INTERVAL);
 	}
 #endif
 
@@ -412,11 +413,11 @@ m68k_context * sync_components(m68k_context * context, uint32_t address)
 			}
 			context->current_cycle -= deduction;
 			z80_adjust_cycles(z_context, deduction);
-			gen->ym->current_cycle -= deduction;
-			gen->psg->cycles -= deduction;
-			if (gen->ym->write_cycle != CYCLE_NEVER) {
-				gen->ym->write_cycle = gen->ym->write_cycle >= deduction ? gen->ym->write_cycle - deduction : 0;
+			ym_adjust_cycles(gen->ym, deduction);
+			if (gen->ym->vgm) {
+				vgm_adjust_cycles(gen->ym->vgm, deduction);
 			}
+			gen->psg->cycles -= deduction;
 			if (gen->reset_cycle != CYCLE_NEVER) {
 				gen->reset_cycle -= deduction;
 			}
@@ -438,18 +439,20 @@ m68k_context * sync_components(m68k_context * context, uint32_t address)
 		context->target_cycle = gen->reset_cycle;
 	}
 	if (address) {
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 		if (gen->header.enter_debugger) {
 			gen->header.enter_debugger = 0;
 			debugger(context, address);
 		}
-		if (gen->header.save_state && (z_context->pc || !z_context->native_pc || z_context->reset || !z_context->busreq)) {
-#else
+#endif
+#ifdef NEW_CORE
 		if (gen->header.save_state) {
+#else
+		if (gen->header.save_state && (z_context->pc || !z_context->native_pc || z_context->reset || !z_context->busreq)) {
 #endif
 			uint8_t slot = gen->header.save_state - 1;
 			gen->header.save_state = 0;
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 			if (z_context->native_pc && !z_context->reset) {
 				//advance Z80 core to the start of an instruction
 				while (!z_context->pc)
@@ -459,7 +462,7 @@ m68k_context * sync_components(m68k_context * context, uint32_t address)
 			}
 #endif
 			char *save_path = slot == SERIALIZE_SLOT ? NULL : get_slot_name(&gen->header, slot, use_native_states ? "state" : "gst");
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 			if (use_native_states || slot == SERIALIZE_SLOT) {
 #endif
 				serialize_buffer state;
@@ -474,7 +477,7 @@ m68k_context * sync_components(m68k_context * context, uint32_t address)
 					save_to_file(&state, save_path);
 					free(state.data);
 				}
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 			} else {
 				save_gst(gen, save_path, address);
 			}
@@ -501,10 +504,10 @@ static m68k_context * vdp_port_write(uint32_t vdp_port, m68k_context * context, 
 #ifdef REFRESH_EMULATION
 	//do refresh check here so we can avoid adding a penalty for a refresh that happens during a VDP access
 	if (context->current_cycle - 4*MCLKS_PER_68K > last_sync_cycle) {
-		refresh_counter += context->current_cycle - 4*MCLKS_PER_68K - last_sync_cycle;
-		context->current_cycle += REFRESH_DELAY * MCLKS_PER_68K * (refresh_counter / (MCLKS_PER_68K * REFRESH_INTERVAL));
-		refresh_counter = refresh_counter % (MCLKS_PER_68K * REFRESH_INTERVAL);
-		last_sync_cycle = context->current_cycle;
+	refresh_counter += context->current_cycle - 4*MCLKS_PER_68K - last_sync_cycle;
+	context->current_cycle += REFRESH_DELAY * MCLKS_PER_68K * (refresh_counter / (MCLKS_PER_68K * REFRESH_INTERVAL));
+	refresh_counter = refresh_counter % (MCLKS_PER_68K * REFRESH_INTERVAL);
+	last_sync_cycle = context->current_cycle;
 	}
 #endif
 	sync_components(context, 0);
@@ -648,32 +651,34 @@ static uint16_t vdp_port_read(uint32_t vdp_port, m68k_context * context)
 		last_sync_cycle = context->current_cycle;
 	}
 #endif
-	sync_components(context, 0);
 	genesis_context *gen = context->system;
 	vdp_context * v_context = gen->vdp;
-	uint32_t before_cycle = v_context->cycles;
 	if (vdp_port < 0x10) {
 		if (vdp_port < 4) {
+			sync_components(context, 0);
+			uint32_t before_cycle = v_context->cycles;
 			value = vdp_data_port_read(v_context);
+			if (v_context->cycles != before_cycle) {
+				//printf("68K paused for %d (%d) cycles at cycle %d (%d) for read\n", v_context->cycles - context->current_cycle, v_context->cycles - before_cycle, context->current_cycle, before_cycle);
+				context->current_cycle = v_context->cycles;
+				//Lock the Z80 out of the bus until the VDP access is complete
+				genesis_context *gen = context->system;
+				gen->bus_busy = 1;
+				sync_z80(gen->z80, v_context->cycles);
+				gen->bus_busy = 0;
+			}
 		} else if(vdp_port < 8) {
+			vdp_run_context(v_context, context->current_cycle);
 			value = vdp_control_port_read(v_context);
 		} else {
+			vdp_run_context(v_context, context->current_cycle);
 			value = vdp_hv_counter_read(v_context);
 			//printf("HV Counter: %X at cycle %d\n", value, v_context->cycles);
 		}
 	} else if (vdp_port < 0x18){
 		fatal_error("Illegal read from PSG  port %X\n", vdp_port);
 	} else {
-		value = vdp_test_port_read(v_context);
-	}
-	if (v_context->cycles != before_cycle) {
-		//printf("68K paused for %d (%d) cycles at cycle %d (%d) for read\n", v_context->cycles - context->current_cycle, v_context->cycles - before_cycle, context->current_cycle, before_cycle);
-		context->current_cycle = v_context->cycles;
-		//Lock the Z80 out of the bus until the VDP access is complete
-		genesis_context *gen = context->system;
-		gen->bus_busy = 1;
-		sync_z80(gen->z80, v_context->cycles);
-		gen->bus_busy = 0;
+		value = get_open_bus_value(&gen->header);
 	}
 #ifdef REFRESH_EMULATION
 	last_sync_cycle -= 4;
@@ -768,9 +773,8 @@ static m68k_context * io_write(uint32_t location, m68k_context * context, uint8_
 			}
 		}
 	} else {
-		location &= 0x1FFF;
-		if (location < 0x100) {
-			switch(location/2)
+		if (location < 0x10100) {
+			switch(location >> 1 & 0xFF)
 			{
 			case 0x1:
 				io_data_write(gen->io.ports, value, context->current_cycle);
@@ -815,7 +819,8 @@ static m68k_context * io_write(uint32_t location, m68k_context * context, uint8_
 				break;
 			}
 		} else {
-			if (location == 0x1100) {
+			uint32_t masked = location & 0xFFF00;
+			if (masked == 0x11100) {
 				if (value & 1) {
 					dputs("bus requesting Z80");
 					if (z80_enabled) {
@@ -840,7 +845,7 @@ static m68k_context * io_write(uint32_t location, m68k_context * context, uint8_
 						gen->z80->busack = 0;
 					}
 				}
-			} else if (location == 0x1200) {
+			} else if (masked == 0x11200) {
 				sync_z80(gen->z80, context->current_cycle);
 				if (value & 1) {
 					if (z80_enabled) {
@@ -856,6 +861,8 @@ static m68k_context * io_write(uint32_t location, m68k_context * context, uint8_
 					}
 					ym_reset(gen->ym);
 				}
+			} else if (masked != 0x11300 && masked != 0x11000) {
+				fatal_error("Machine freeze due to unmapped write to address %X\n", location | 0xA00000);
 			}
 		}
 	}
@@ -891,17 +898,20 @@ static uint8_t io_read(uint32_t location, m68k_context * context)
 				value = gen->zram[location & 0x1FFF];
 			} else if (location < 0x6000) {
 				sync_sound(gen, context->current_cycle);
-				value = ym_read_status(gen->ym);
+				value = ym_read_status(gen->ym, context->current_cycle, location);
+			} else if (location < 0x7F00) {
+				value = 0xFF;
 			} else {
+				fatal_error("Machine freeze due to read of Z80 VDP memory window by 68K: %X\n", location | 0xA00000);
 				value = 0xFF;
 			}
 		} else {
-			value = 0xFF;
+			uint16_t word = get_open_bus_value(&gen->header);
+			value = location & 1 ? word : word >> 8;
 		}
 	} else {
-		location &= 0x1FFF;
-		if (location < 0x100) {
-			switch(location/2)
+		if (location < 0x10100) {
+			switch(location >> 1 & 0xFF)
 			{
 			case 0x0:
 				//version bits should be 0 for now since we're not emulating TMSS
@@ -953,18 +963,24 @@ static uint8_t io_read(uint32_t location, m68k_context * context)
 				value = gen->io.ports[2].serial_ctrl;
 				break;
 			default:
-				value = 0xFF;
+				value = get_open_bus_value(&gen->header) >> 8;
 			}
 		} else {
-			if (location == 0x1100) {
+			uint32_t masked = location & 0xFFF00;
+			if (masked == 0x11100) {
 				value = z80_enabled ? !z80_get_busack(gen->z80, context->current_cycle) : !gen->z80->busack;
 				value |= (get_open_bus_value(&gen->header) >> 8) & 0xFE;
 				dprintf("Byte read of BUSREQ returned %d @ %d (reset: %d)\n", value, context->current_cycle, gen->z80->reset);
-			} else if (location == 0x1200) {
+			} else if (masked == 0x11200) {
 				value = !gen->z80->reset;
+			} else if (masked == 0x11300 || masked == 0x11000) {
+				//A11300 is apparently completely unused
+				//A11000 is the memory control register which I am assuming is write only
+				value = get_open_bus_value(&gen->header) >> 8;
 			} else {
+				location |= 0xA00000;
+				fatal_error("Machine freeze due to read of unmapped IO location %X\n", location);
 				value = 0xFF;
-				printf("Byte read of unknown IO location: %X\n", location);
 			}
 		}
 	}
@@ -1004,18 +1020,16 @@ static uint8_t z80_read_ym(uint32_t location, void * vcontext)
 	z80_context * context = vcontext;
 	genesis_context * gen = context->system;
 	sync_sound(gen, context->Z80_CYCLE);
-	return ym_read_status(gen->ym);
+	return ym_read_status(gen->ym, context->Z80_CYCLE, location);
 }
 
 static uint8_t z80_read_bank(uint32_t location, void * vcontext)
 {
 	z80_context * context = vcontext;
 	genesis_context *gen = context->system;
-
 	if (gen->bus_busy) {
 		context->Z80_CYCLE = gen->m68k->current_cycle;
 	}
-
 	//typical delay from bus arbitration
 	context->Z80_CYCLE += 3 * MCLKS_PER_Z80;
 	//TODO: add cycle for an access right after a previous one
@@ -1030,6 +1044,10 @@ static uint8_t z80_read_bank(uint32_t location, void * vcontext)
 	uint32_t address = gen->z80_bank_reg << 15 | location;
 	if (address >= 0xC00000 && address < 0xE00000) {
 		return z80_vdp_port_read(location & 0xFF, context);
+	} else if (address >= 0xA10000 && address <= 0xA10001) {
+		//Apparently version reg can be read through Z80 banked area
+		//TODO: Check rest of IO region addresses
+		return gen->version_reg;
 	} else {
 		fprintf(stderr, "Unhandled read by Z80 from address %X through banked memory area (%X)\n", address, gen->z80_bank_reg << 15);
 	}
@@ -1072,6 +1090,80 @@ static void *z80_write_bank_reg(uint32_t location, void * vcontext, uint8_t valu
 	update_z80_bank_pointer(context->system);
 
 	return context;
+}
+
+static uint16_t unused_read(uint32_t location, void *vcontext)
+{
+	m68k_context *context = vcontext;
+	genesis_context *gen = context->system;
+	if ((location >= 0xA13000 && location < 0xA13100) || (location >= 0xA12000 && location < 0xA12100)) {
+		//Only called if the cart/exp doesn't have a more specific handler for this region
+		return get_open_bus_value(&gen->header);
+	} else if (location == 0xA14000 || location == 0xA14002) {
+		if (gen->version_reg & 0xF) {
+			return gen->tmss_lock[location >> 1 & 1];
+		} else {
+			fatal_error("Machine freeze due to read from TMSS lock when TMSS is not present %X\n", location);
+			return 0xFFFF;
+		}
+	} else if (location == 0xA14100) {
+		if (gen->version_reg & 0xF) {
+			return get_open_bus_value(&gen->header);
+		} else {
+			fatal_error("Machine freeze due to read from TMSS control when TMSS is not present %X\n", location);
+			return 0xFFFF;
+		}
+	} else {
+		fatal_error("Machine freeze due to unmapped read from %X\n", location);
+		return 0xFFFF;
+	}
+}
+
+static uint8_t unused_read_b(uint32_t location, void *vcontext)
+{
+	uint16_t v = unused_read(location & 0xFFFFFE, vcontext);
+	if (location & 1) {
+		return v;
+	} else {
+		return v >> 8;
+	}
+}
+
+static void *unused_write(uint32_t location, void *vcontext, uint16_t value)
+{
+	m68k_context *context = vcontext;
+	genesis_context *gen = context->system;
+	uint8_t has_tmss = gen->version_reg & 0xF;
+	if (has_tmss && (location == 0xA14000 || location == 0xA14002)) {
+		gen->tmss_lock[location >> 1 & 1] = value;
+	} else if (has_tmss && location == 0xA14100) {
+		//TODO: implement TMSS control register
+	} else if (location < 0xA12000 || location >= 0xA13100 || (location >= 0xA12100 && location < 0xA13000)) {
+		fatal_error("Machine freeze due to unmapped write to %X\n", location);
+	}
+	return vcontext;
+}
+
+static void *unused_write_b(uint32_t location, void *vcontext, uint8_t value)
+{
+	m68k_context *context = vcontext;
+	genesis_context *gen = context->system;
+	uint8_t has_tmss = gen->version_reg & 0xF;
+	if (has_tmss && location >= 0xA14000 && location <= 0xA14003) {
+		uint32_t offset = location >> 1 & 1;
+		if (location & 1) {
+			gen->tmss_lock[offset] &= 0xFF00;
+			gen->tmss_lock[offset] |= value;
+		} else {
+			gen->tmss_lock[offset] &= 0xFF;
+			gen->tmss_lock[offset] |= value << 8;
+		}
+	} else if (has_tmss && (location == 0xA14100 || location == 0xA14101)) {
+		//TODO: implement TMSS control register
+	} else if (location < 0xA12000 || location >= 0xA13100 || (location >= 0xA12100 && location < 0xA13000)) {
+		fatal_error("Machine freeze due to unmapped byte write to %X\n", location);
+	}
+	return vcontext;
 }
 
 static void set_speed_percent(system_header * system, uint32_t percent)
@@ -1132,19 +1224,19 @@ static uint8_t load_state(system_header *system, uint8_t slot)
 	if (load_from_file(&state, statepath)) {
 		genesis_deserialize(&state, gen);
 		free(state.data);
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 		//HACK
 		pc = gen->m68k->last_prefetch_address;
 #endif
 		ret = 1;
 	} else {
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 		strcpy(statepath + strlen(statepath)-strlen("state"), "gst");
 		pc = load_gst(gen, statepath);
 		ret = pc != 0;
 #endif
 	}
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	if (ret) {
 		gen->m68k->resume_pc = get_native_address_trans(gen->m68k, pc);
 	}
@@ -1191,12 +1283,12 @@ static void start_genesis(system_header *system, char *statefile)
 		if (load_from_file(&state, statefile)) {
 			genesis_deserialize(&state, gen);
 			free(state.data);
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 			//HACK
 			pc = gen->m68k->last_prefetch_address;
 #endif
 		} else {
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 			pc = load_gst(gen, statefile);
 			if (!pc) {
 				fatal_error("Failed to load save state %s\n", statefile);
@@ -1204,7 +1296,7 @@ static void start_genesis(system_header *system, char *statefile)
 #endif
 		}
 		printf("Loaded %s\n", statefile);
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 		if (gen->header.enter_debugger) {
 			gen->header.enter_debugger = 0;
 			insert_breakpoint(gen->m68k, pc, gen->header.debugger_type == DEBUGGER_NATIVE ? debugger : gdb_debug_enter);
@@ -1213,7 +1305,7 @@ static void start_genesis(system_header *system, char *statefile)
 		adjust_int_cycle(gen->m68k, gen->vdp);
 		start_68k_context(gen->m68k, pc);
 	} else {
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 		if (gen->header.enter_debugger) {
 			gen->header.enter_debugger = 0;
 			uint32_t address = gen->cart[2] << 16 | gen->cart[3];
@@ -1264,7 +1356,13 @@ static void persist_save(system_header *system)
 		fprintf(stderr, "Failed to open %s file %s for writing\n", save_type_name(gen->save_type), save_filename);
 		return;
 	}
+	if (gen->save_type == RAM_FLAG_BOTH) {
+		byteswap_rom(gen->save_size, (uint16_t *)gen->save_storage);
+	}
 	fwrite(gen->save_storage, 1, gen->save_size, f);
+	if (gen->save_type == RAM_FLAG_BOTH) {
+		byteswap_rom(gen->save_size, (uint16_t *)gen->save_storage);
+	}
 	fclose(f);
 	printf("Saved %s to %s\n", save_type_name(gen->save_type), save_filename);
 }
@@ -1277,6 +1375,9 @@ static void load_save(system_header *system)
 		uint32_t read = fread(gen->save_storage, 1, gen->save_size, f);
 		fclose(f);
 		if (read > 0) {
+			if (gen->save_type == RAM_FLAG_BOTH) {
+				byteswap_rom(gen->save_size, (uint16_t *)gen->save_storage);
+			}
 			printf("Loaded %s from %s\n", save_type_name(gen->save_type), save_filename);
 		}
 	}
@@ -1387,6 +1488,30 @@ static void config_updated(system_header *system)
 	set_audio_config(gen);
 }
 
+static void start_vgm_log(system_header *system, char *filename)
+{
+	genesis_context *gen = (genesis_context *)system;
+	vgm_writer *vgm = vgm_write_open(filename, gen->version_reg & HZ50 ? 50 : 60, gen->master_clock, gen->m68k->current_cycle);
+	if (vgm) {
+		printf("Started logging VGM to %s\n", filename);
+		sync_sound(gen, vgm->last_cycle);
+		ym_vgm_log(gen->ym, gen->master_clock, vgm);
+		psg_vgm_log(gen->psg, gen->master_clock, vgm);
+		gen->header.vgm_logging = 1;
+	} else {
+		printf("Failed to start logging to %s\n", filename);
+	}
+}
+
+static void stop_vgm_log(system_header *system)
+{
+	puts("Stopped VGM log");
+	genesis_context *gen = (genesis_context *)system;
+	vgm_close(gen->ym->vgm);
+	gen->ym->vgm = gen->psg->vgm = NULL;
+	gen->header.vgm_logging = 0;
+}
+
 genesis_context *alloc_init_genesis(rom_info *rom, void *main_rom, void *lock_on, uint32_t system_opts, uint8_t force_region)
 {
 	static memmap_chunk z80_map[] = {
@@ -1419,11 +1544,19 @@ genesis_context *alloc_init_genesis(rom_info *rom, void *main_rom, void *lock_on
 	gen->header.config_updated = config_updated;
 	gen->header.serialize = serialize;
 	gen->header.deserialize = deserialize;
+	gen->header.start_vgm_log = start_vgm_log;
+	gen->header.stop_vgm_log = stop_vgm_log;
 	gen->header.type = SYSTEM_GENESIS;
 	gen->header.info = *rom;
 	set_region(gen, rom, force_region);
+	tern_node *model = get_model(config, SYSTEM_GENESIS);
+	uint8_t tmss = !strcmp(tern_find_ptr_default(model, "tmss", "off"), "on");
+	if (tmss) {
+		gen->version_reg |= 1;
+	}
 
-	gen->vdp = init_vdp_context(gen->version_reg & 0x40);
+	uint8_t max_vsram = !strcmp(tern_find_ptr_default(model, "vsram", "40"), "64");
+	gen->vdp = init_vdp_context(gen->version_reg & 0x40, max_vsram);
 	gen->vdp->system = &gen->header;
 	gen->frame_end = vdp_cycles_to_frame_end(gen->vdp);
 	char * config_cycles = tern_find_path(config, "clocks\0max_cycles\0", TVAL_PTR).ptrval;
@@ -1446,7 +1579,7 @@ genesis_context *alloc_init_genesis(rom_info *rom, void *main_rom, void *lock_on
 	z80_options *z_opts = malloc(sizeof(z80_options));
 	init_z80_opts(z_opts, z80_map, 5, NULL, 0, MCLKS_PER_Z80, 0xFFFF);
 	gen->z80 = init_z80_context(z_opts);
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	gen->z80->next_int_pulse = z80_next_int_pulse;
 #endif
 	z80_assert_reset(gen->z80, 0);
@@ -1484,7 +1617,7 @@ genesis_context *alloc_init_genesis(rom_info *rom, void *main_rom, void *lock_on
 		{
 			write_cram_internal(gen->vdp, i, rand());
 		}
-		for (int i = 0; i < VSRAM_SIZE; i++)
+		for (int i = 0; i < gen->vdp->vsram_size; i++)
 		{
 			gen->vdp->vsram[i] = rand();
 		}
@@ -1521,8 +1654,9 @@ genesis_context *alloc_init_genesis(rom_info *rom, void *main_rom, void *lock_on
 
 	m68k_options *opts = malloc(sizeof(m68k_options));
 	init_m68k_opts(opts, rom->map, rom->map_chunks, MCLKS_PER_68K);
-	//TODO: make this configurable
-	opts->gen.flags |= M68K_OPT_BROKEN_READ_MODIFY;
+	if (!strcmp(tern_find_ptr_default(model, "tas", "broken"), "broken")) {
+		opts->gen.flags |= M68K_OPT_BROKEN_READ_MODIFY;
+	}
 	gen->m68k = init_68k_context(opts, NULL);
 	gen->m68k->system = gen;
 	opts->address_log = (system_opts & OPT_ADDRESS_LOG) ? fopen("address.log", "w") : NULL;
@@ -1556,7 +1690,10 @@ genesis_context *alloc_config_genesis(void *rom, uint32_t rom_size, void *lock_o
 		           (read_8_fun)vdp_port_read_b, (write_8_fun)vdp_port_write_b},
 		{0xA00000, 0xA12000,  0x1FFFF,  0, 0, 0,                                  NULL,
 		           (read_16_fun)io_read_w,      (write_16_fun)io_write_w,
-		           (read_8_fun)io_read,         (write_8_fun)io_write}
+		           (read_8_fun)io_read,         (write_8_fun)io_write},
+		{0x000000, 0xFFFFFF, 0xFFFFFF, 0, 0, 0,                                   NULL,
+		           (read_16_fun)unused_read,    (write_16_fun)unused_write,
+		           (read_8_fun)unused_read_b,   (write_8_fun)unused_write_b}
 	};
 	static tern_node *rom_db;
 	if (!rom_db) {

@@ -21,9 +21,7 @@
 #define dfopen(var, fname, mode)
 #endif
 
-#define BUSY_CYCLES_ADDRESS 17
-#define BUSY_CYCLES_DATA_LOW 83
-#define BUSY_CYCLES_DATA_HIGH 47
+#define BUSY_CYCLES 32
 #define OP_UPDATE_PERIOD 144
 
 #define BIT_TIMERA_ENABLE 0x1
@@ -122,6 +120,27 @@ void ym_adjust_master_clock(ym2612_context * context, uint32_t master_clock)
 	render_audio_adjust_clock(context->audio, master_clock, context->clock_inc * NUM_OPERATORS);
 }
 
+void ym_adjust_cycles(ym2612_context *context, uint32_t deduction)
+{
+	context->current_cycle -= deduction;
+	if (context->write_cycle != CYCLE_NEVER && context->write_cycle >= deduction) {
+		context->write_cycle -= deduction;
+	} else {
+		context->write_cycle = CYCLE_NEVER;
+	}
+	if (context->busy_start != CYCLE_NEVER && context->busy_start >= deduction) {
+		context->busy_start -= deduction;
+	} else {
+		context->busy_start = CYCLE_NEVER;
+	}
+	if (context->last_status_cycle != CYCLE_NEVER && context->last_status_cycle >= deduction) {
+		context->last_status_cycle -= deduction;
+	} else {
+		context->last_status = 0;
+		context->last_status_cycle = CYCLE_NEVER;
+	}
+}
+
 #ifdef __ANDROID__
 #define log2(x) (log(x)/log(2))
 #endif
@@ -173,7 +192,11 @@ void ym_init(ym2612_context * context, uint32_t master_clock, uint32_t clock_div
 	dfopen(debug_file, "ym_debug.txt", "w");
 	memset(context, 0, sizeof(*context));
 	context->clock_inc = clock_div * 6;
+	context->busy_cycles = BUSY_CYCLES * context->clock_inc;
 	context->audio = render_audio_source(master_clock, context->clock_inc * NUM_OPERATORS, 2);
+	//TODO: pick a randomish high initial value and lower it over time
+	context->invalid_status_decay = 225000 * context->clock_inc;
+	context->status_address_mask = (options & YM_OPT_3834) ? 0 : 3;
 	
 	//some games seem to expect that the LR flags start out as 1
 	for (int i = 0; i < NUM_CHANNELS; i++) {
@@ -338,128 +361,287 @@ static void csm_keyoff(ym2612_context *context)
 	}
 }
 
+void ym_run_timers(ym2612_context *context)
+{
+	if (context->timer_control & BIT_TIMERA_ENABLE) {
+		if (context->timer_a != TIMER_A_MAX) {
+			context->timer_a++;
+			if (context->csm_keyon) {
+				csm_keyoff(context);
+			}
+		} else {
+			if (context->timer_control & BIT_TIMERA_LOAD) {
+				context->timer_control &= ~BIT_TIMERA_LOAD;
+			} else if (context->timer_control & BIT_TIMERA_OVEREN) {
+				context->status |= BIT_STATUS_TIMERA;
+			}
+			context->timer_a = context->timer_a_load;
+			if (!context->csm_keyon && context->ch3_mode == CSM_MODE) {
+				context->csm_keyon = 0xF0;
+				uint8_t changes = 0xF0 ^ context->channels[2].keyon;;
+				for (uint8_t op = 2*4, bit = 0; op < 3*4; op++, bit++)
+				{
+					if (changes & keyon_bits[bit]) {
+						keyon(context->operators + op, context->channels + 2);
+					}
+				}
+			}
+		}
+	}
+	if (!context->sub_timer_b) {
+		if (context->timer_control & BIT_TIMERB_ENABLE) {
+			if (context->timer_b != TIMER_B_MAX) {
+				context->timer_b++;
+			} else {
+				if (context->timer_control & BIT_TIMERB_LOAD) {
+					context->timer_control &= ~BIT_TIMERB_LOAD;
+				} else if (context->timer_control & BIT_TIMERB_OVEREN) {
+					context->status |= BIT_STATUS_TIMERB;
+				}
+				context->timer_b = context->timer_b_load;
+			}
+		}
+	}
+	context->sub_timer_b += 0x10;
+	//Update LFO
+	if (context->lfo_enable) {
+		if (context->lfo_counter) {
+			context->lfo_counter--;
+		} else {
+			context->lfo_counter = lfo_timer_values[context->lfo_freq];
+			context->lfo_am_step += 2;
+			context->lfo_am_step &= 0xFE;
+			uint8_t old_pm_step = context->lfo_pm_step;
+			context->lfo_pm_step = context->lfo_am_step / 8;
+			if (context->lfo_pm_step != old_pm_step) {
+				for (int chan = 0; chan < NUM_CHANNELS; chan++)
+				{
+					if (context->channels[chan].pms) {
+						for (int op = chan * 4; op < (chan + 1) * 4; op++)
+						{
+							context->operators[op].phase_inc = ym_calc_phase_inc(context, context->operators + op, op);
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+void ym_run_envelope(ym2612_context *context, ym_channel *channel, ym_operator *operator)
+{
+	uint32_t env_cyc = context->env_counter;
+	uint8_t rate;
+	if (operator->env_phase == PHASE_DECAY && operator->envelope >= operator->sustain_level) {
+		//operator->envelope = operator->sustain_level;
+		operator->env_phase = PHASE_SUSTAIN;
+	}
+	rate = operator->rates[operator->env_phase];
+	if (rate) {
+		uint8_t ks = channel->keycode >> operator->key_scaling;;
+		rate = rate*2 + ks;
+		if (rate > 63) {
+			rate = 63;
+		}
+	}
+	uint32_t cycle_shift = rate < 0x30 ? ((0x2F - rate) >> 2) : 0;
+	if (!(env_cyc & ((1 << cycle_shift) - 1))) {
+		uint32_t update_cycle = env_cyc >> cycle_shift & 0x7;
+		uint16_t envelope_inc = rate_table[rate * 8 + update_cycle];
+		if (operator->env_phase == PHASE_ATTACK) {
+			//this can probably be optimized to a single shift rather than a multiply + shift
+			uint16_t old_env = operator->envelope;
+			operator->envelope += ((~operator->envelope * envelope_inc) >> 4) & 0xFFFFFFFC;
+			if (operator->envelope > old_env) {
+				//Handle overflow
+				operator->envelope = 0;
+			}
+			if (!operator->envelope) {
+				operator->env_phase = PHASE_DECAY;
+			}
+		} else {
+			if (operator->ssg) {
+				if (operator->envelope < SSG_CENTER) {
+					envelope_inc *= 4;
+				} else {
+					envelope_inc = 0;
+				}
+			}
+			//envelope value is 10-bits, but it will be used as a 4.8 value
+			operator->envelope += envelope_inc << 2;
+			//clamp to max attenuation value
+			if (
+				operator->envelope > MAX_ENVELOPE 
+				|| (operator->env_phase == PHASE_RELEASE && operator->envelope >= SSG_CENTER)
+			) {
+				operator->envelope = MAX_ENVELOPE;
+			}
+		}
+	}
+}
+
+void ym_run_phase(ym2612_context *context, uint32_t channel, uint32_t op)
+{
+	if (channel != 5 || !context->dac_enable) {
+		//printf("updating operator %d of channel %d\n", op, channel);
+		ym_operator * operator = context->operators + op;
+		ym_channel * chan = context->channels + channel;
+		uint16_t phase = operator->phase_counter >> 10 & 0x3FF;
+		operator->phase_counter += operator->phase_inc;//ym_calc_phase_inc(context, operator, op);
+		int16_t mod = 0;
+		if (op & 3) {
+			if (operator->mod_src[0]) {
+				mod = *operator->mod_src[0];
+				if (operator->mod_src[1]) {
+					mod += *operator->mod_src[1];
+				}
+				mod >>= YM_MOD_SHIFT;
+			}
+		} else {
+			if (chan->feedback) {
+				mod = (chan->op1_old + operator->output) >> (10-chan->feedback);
+			}
+		}
+		uint16_t env = operator->envelope;
+		if (operator->ssg) {
+			if (env >= SSG_CENTER) {
+				if (operator->ssg & SSG_ALTERNATE) {
+					if (operator->env_phase != PHASE_RELEASE && (
+						!(operator->ssg & SSG_HOLD) || ((operator->ssg ^ operator->inverted) & SSG_INVERT) == 0
+					)) {
+						operator->inverted ^= SSG_INVERT;
+					}
+				} else if (!(operator->ssg & SSG_HOLD)) {
+					phase = operator->phase_counter = 0;
+				}
+				if (
+					(operator->env_phase == PHASE_DECAY || operator->env_phase == PHASE_SUSTAIN) 
+					&& !(operator->ssg & SSG_HOLD)
+				) {
+					start_envelope(operator, chan);
+					env = operator->envelope;
+				}
+			}
+			if (operator->inverted) {
+				env = (SSG_CENTER - env) & MAX_ENVELOPE;
+			}
+		}
+		env += operator->total_level;
+		if (operator->am) {
+			uint16_t base_am = (context->lfo_am_step & 0x80 ? context->lfo_am_step : ~context->lfo_am_step) & 0x7E;
+			if (ams_shift[chan->ams] >= 0) {
+				env += (base_am >> ams_shift[chan->ams]) & MAX_ENVELOPE;
+			} else {
+				env += base_am << (-ams_shift[chan->ams]);
+			}
+		}
+		if (env > MAX_ENVELOPE) {
+			env = MAX_ENVELOPE;
+		}
+		if (first_key_on) {
+			dfprintf(debug_file, "op %d, base phase: %d, mod: %d, sine: %d, out: %d\n", op, phase, mod, sine_table[(phase+mod) & 0x1FF], pow_table[sine_table[phase & 0x1FF] + env]);
+		}
+		//if ((channel != 0 && channel != 4) || chan->algorithm != 5) {
+			phase += mod;
+		//}
+
+		int16_t output = pow_table[sine_table[phase & 0x1FF] + env];
+		if (phase & 0x200) {
+			output = -output;
+		}
+		if (op % 4 == 0) {
+			chan->op1_old = operator->output;
+		} else if (op % 4 == 2) {
+			chan->op2_old = operator->output;
+		}
+		operator->output = output;
+		//Update the channel output if we've updated all operators
+		if (op % 4 == 3) {
+			if (chan->algorithm < 4) {
+				chan->output = operator->output;
+			} else if(chan->algorithm == 4) {
+				chan->output = operator->output + context->operators[channel * 4 + 2].output;
+			} else {
+				output = 0;
+				for (uint32_t op = ((chan->algorithm == 7) ? 0 : 1) + channel*4; op < (channel+1)*4; op++) {
+					output += context->operators[op].output;
+				}
+				chan->output = output;
+			}
+			if (first_key_on) {
+				int16_t value = context->channels[channel].output & 0x3FE0;
+				if (value & 0x2000) {
+					value |= 0xC000;
+				}
+			}
+		}
+		//puts("operator update done");
+	}
+}
+
+void ym_output_sample(ym2612_context *context)
+{
+	int16_t left = 0, right = 0;
+	for (int i = 0; i < NUM_CHANNELS; i++) {
+		int16_t value = context->channels[i].output;
+		if (value > 0x1FE0) {
+			value = 0x1FE0;
+		} else if (value < -0x1FF0) {
+			value = -0x1FF0;
+		} else {
+			value &= 0x3FE0;
+			if (value & 0x2000) {
+				value |= 0xC000;
+			}
+		}
+		if (value >= 0) {
+			value += context->zero_offset;
+		} else {
+			value -= context->zero_offset;
+		}
+		if (context->channels[i].logfile) {
+			fwrite(&value, sizeof(value), 1, context->channels[i].logfile);
+		}
+		if (context->channels[i].lr & 0x80) {
+			left += (value * context->volume_mult) / context->volume_div;
+		} else if (context->zero_offset) {
+			if (value >= 0) {
+				left += (context->zero_offset * context->volume_mult) / context->volume_div;
+			} else {
+				left -= (context->zero_offset * context->volume_mult) / context->volume_div;
+			}
+		}
+		if (context->channels[i].lr & 0x40) {
+			right += (value * context->volume_mult) / context->volume_div;
+		} else if (context->zero_offset) {
+			if (value >= 0) {
+				right += (context->zero_offset * context->volume_mult) / context->volume_div;
+			} else {
+				right -= (context->zero_offset * context->volume_mult) / context->volume_div;
+			}
+		}
+	}
+	render_put_stereo_sample(context->audio, left, right);
+}
+
 void ym_run(ym2612_context * context, uint32_t to_cycle)
 {
+	if (context->current_cycle >= to_cycle) {
+		return;
+	}
 	//printf("Running YM2612 from cycle %d to cycle %d\n", context->current_cycle, to_cycle);
 	//TODO: Fix channel update order OR remap channels in register write
 	for (; context->current_cycle < to_cycle; context->current_cycle += context->clock_inc) {
 		//Update timers at beginning of 144 cycle period
 		if (!context->current_op) {
-			if (context->timer_control & BIT_TIMERA_ENABLE) {
-				if (context->timer_a != TIMER_A_MAX) {
-					context->timer_a++;
-					if (context->csm_keyon) {
-						csm_keyoff(context);
-					}
-				} else {
-					if (context->timer_control & BIT_TIMERA_LOAD) {
-						context->timer_control &= ~BIT_TIMERA_LOAD;
-					} else if (context->timer_control & BIT_TIMERA_OVEREN) {
-						context->status |= BIT_STATUS_TIMERA;
-					}
-					context->timer_a = context->timer_a_load;
-					if (!context->csm_keyon && context->ch3_mode == CSM_MODE) {
-						context->csm_keyon = 0xF0;
-						uint8_t changes = 0xF0 ^ context->channels[2].keyon;;
-						for (uint8_t op = 2*4, bit = 0; op < 3*4; op++, bit++)
-						{
-							if (changes & keyon_bits[bit]) {
-								keyon(context->operators + op, context->channels + 2);
-							}
-						}
-					}
-				}
-			}
-			if (!context->sub_timer_b) {
-				if (context->timer_control & BIT_TIMERB_ENABLE) {
-					if (context->timer_b != TIMER_B_MAX) {
-						context->timer_b++;
-					} else {
-						if (context->timer_control & BIT_TIMERB_LOAD) {
-							context->timer_control &= ~BIT_TIMERB_LOAD;
-						} else if (context->timer_control & BIT_TIMERB_OVEREN) {
-							context->status |= BIT_STATUS_TIMERB;
-						}
-						context->timer_b = context->timer_b_load;
-					}
-				}
-			}
-			context->sub_timer_b += 0x10;
-			//Update LFO
-			if (context->lfo_enable) {
-				if (context->lfo_counter) {
-					context->lfo_counter--;
-				} else {
-					context->lfo_counter = lfo_timer_values[context->lfo_freq];
-					context->lfo_am_step += 2;
-					context->lfo_am_step &= 0xFE;
-					context->lfo_pm_step = context->lfo_am_step / 8;
-				}
-			}
+			ym_run_timers(context);
 		}
 		//Update Envelope Generator
 		if (!(context->current_op % 3)) {
-			uint32_t env_cyc = context->env_counter;
 			uint32_t op = context->current_env_op;
 			ym_operator * operator = context->operators + op;
 			ym_channel * channel = context->channels + op/4;
-			uint8_t rate;
-			if (operator->env_phase == PHASE_DECAY && operator->envelope >= operator->sustain_level) {
-				//operator->envelope = operator->sustain_level;
-				operator->env_phase = PHASE_SUSTAIN;
-			}
-			rate = operator->rates[operator->env_phase];
-			if (rate) {
-				uint8_t ks = channel->keycode >> operator->key_scaling;;
-				rate = rate*2 + ks;
-				if (rate > 63) {
-					rate = 63;
-				}
-			}
-			uint32_t cycle_shift = rate < 0x30 ? ((0x2F - rate) >> 2) : 0;
-			if (first_key_on) {
-				dfprintf(debug_file, "Operator: %d, env rate: %d (2*%d+%d), env_cyc: %d, cycle_shift: %d, env_cyc & ((1 << cycle_shift) - 1): %d\n", op, rate, operator->rates[operator->env_phase], channel->keycode >> operator->key_scaling,env_cyc, cycle_shift, env_cyc & ((1 << cycle_shift) - 1));
-			}
-			if (!(env_cyc & ((1 << cycle_shift) - 1))) {
-				uint32_t update_cycle = env_cyc >> cycle_shift & 0x7;
-				uint16_t envelope_inc = rate_table[rate * 8 + update_cycle];
-				if (operator->env_phase == PHASE_ATTACK) {
-					//this can probably be optimized to a single shift rather than a multiply + shift
-					if (first_key_on) {
-						dfprintf(debug_file, "Changing op %d envelope %d by %d(%d * %d) in attack phase\n", op, operator->envelope, (~operator->envelope * envelope_inc) >> 4, ~operator->envelope, envelope_inc);
-					}
-					uint16_t old_env = operator->envelope;
-					operator->envelope += ((~operator->envelope * envelope_inc) >> 4) & 0xFFFFFFFC;
-					if (operator->envelope > old_env) {
-						//Handle overflow
-						operator->envelope = 0;
-					}
-					if (!operator->envelope) {
-						operator->env_phase = PHASE_DECAY;
-					}
-				} else {
-					if (first_key_on) {
-						dfprintf(debug_file, "Changing op %d envelope %d by %d in %s phase\n", op, operator->envelope, envelope_inc,
-							operator->env_phase == PHASE_SUSTAIN ? "sustain" : (operator->env_phase == PHASE_DECAY ? "decay": "release"));
-					}
-					if (operator->ssg) {
-						if (operator->envelope < SSG_CENTER) {
-							envelope_inc *= 4;
-						} else {
-							envelope_inc = 0;
-						}
-					}
-					//envelope value is 10-bits, but it will be used as a 4.8 value
-					operator->envelope += envelope_inc << 2;
-					//clamp to max attenuation value
-					if (
-						operator->envelope > MAX_ENVELOPE 
-						|| (operator->env_phase == PHASE_RELEASE && operator->envelope >= SSG_CENTER)
-					) {
-						operator->envelope = MAX_ENVELOPE;
-					}
-				}
-			}
+			ym_run_envelope(context, channel, operator);
 			context->current_env_op++;
 			if (context->current_env_op == NUM_OPERATORS) {
 				context->current_env_op = 0;
@@ -468,155 +650,13 @@ void ym_run(ym2612_context * context, uint32_t to_cycle)
 		}
 
 		//Update Phase Generator
-		uint32_t channel = context->current_op / 4;
-		if (channel != 5 || !context->dac_enable) {
-			uint32_t op = context->current_op;
-			//printf("updating operator %d of channel %d\n", op, channel);
-			ym_operator * operator = context->operators + op;
-			ym_channel * chan = context->channels + channel;
-			uint16_t phase = operator->phase_counter >> 10 & 0x3FF;
-			operator->phase_counter += ym_calc_phase_inc(context, operator, context->current_op);
-			int16_t mod = 0;
-			if (op & 3) {
-				if (operator->mod_src[0]) {
-					mod = *operator->mod_src[0];
-					if (operator->mod_src[1]) {
-						mod += *operator->mod_src[1];
-					}
-					mod >>= YM_MOD_SHIFT;
-				}
-			} else {
-				if (chan->feedback) {
-					mod = (chan->op1_old + operator->output) >> (10-chan->feedback);
-				}
-			}
-			uint16_t env = operator->envelope;
-			if (operator->ssg) {
-				if (env >= SSG_CENTER) {
-					if (operator->ssg & SSG_ALTERNATE) {
-						if (operator->env_phase != PHASE_RELEASE && (
-							!(operator->ssg & SSG_HOLD) || ((operator->ssg ^ operator->inverted) & SSG_INVERT) == 0
-						)) {
-							operator->inverted ^= SSG_INVERT;
-						}
-					} else if (!(operator->ssg & SSG_HOLD)) {
-						phase = operator->phase_counter = 0;
-					}
-					if (
-						(operator->env_phase == PHASE_DECAY || operator->env_phase == PHASE_SUSTAIN) 
-						&& !(operator->ssg & SSG_HOLD)
-					) {
-						start_envelope(operator, chan);
-						env = operator->envelope;
-					}
-				}
-				if (operator->inverted) {
-					env = (SSG_CENTER - env) & MAX_ENVELOPE;
-				}
-			}
-			env += operator->total_level;
-			if (operator->am) {
-				uint16_t base_am = (context->lfo_am_step & 0x80 ? context->lfo_am_step : ~context->lfo_am_step) & 0x7E;
-				if (ams_shift[chan->ams] >= 0) {
-					env += (base_am >> ams_shift[chan->ams]) & MAX_ENVELOPE;
-				} else {
-					env += base_am << (-ams_shift[chan->ams]);
-				}
-			}
-			if (env > MAX_ENVELOPE) {
-				env = MAX_ENVELOPE;
-			}
-			if (first_key_on) {
-				dfprintf(debug_file, "op %d, base phase: %d, mod: %d, sine: %d, out: %d\n", op, phase, mod, sine_table[(phase+mod) & 0x1FF], pow_table[sine_table[phase & 0x1FF] + env]);
-			}
-			//if ((channel != 0 && channel != 4) || chan->algorithm != 5) {
-				phase += mod;
-			//}
-
-			int16_t output = pow_table[sine_table[phase & 0x1FF] + env];
-			if (phase & 0x200) {
-				output = -output;
-			}
-			if (op % 4 == 0) {
-				chan->op1_old = operator->output;
-			} else if (op % 4 == 2) {
-				chan->op2_old = operator->output;
-			}
-			operator->output = output;
-			//Update the channel output if we've updated all operators
-			if (op % 4 == 3) {
-				if (chan->algorithm < 4) {
-					chan->output = operator->output;
-				} else if(chan->algorithm == 4) {
-					chan->output = operator->output + context->operators[channel * 4 + 2].output;
-				} else {
-					output = 0;
-					for (uint32_t op = ((chan->algorithm == 7) ? 0 : 1) + channel*4; op < (channel+1)*4; op++) {
-						output += context->operators[op].output;
-					}
-					chan->output = output;
-				}
-				if (first_key_on) {
-					int16_t value = context->channels[channel].output & 0x3FE0;
-					if (value & 0x2000) {
-						value |= 0xC000;
-					}
-					dfprintf(debug_file, "channel %d output: %d\n", channel, (value * context->volume_mult) / context->volume_div);
-				}
-			}
-			//puts("operator update done");
-		}
+		ym_run_phase(context, context->current_op / 4, context->current_op);
 		context->current_op++;
 		if (context->current_op == NUM_OPERATORS) {
 			context->current_op = 0;
-			
-			int16_t left = 0, right = 0;
-			for (int i = 0; i < NUM_CHANNELS; i++) {
-				int16_t value = context->channels[i].output;
-				if (value > 0x1FE0) {
-					value = 0x1FE0;
-				} else if (value < -0x1FF0) {
-					value = -0x1FF0;
-				} else {
-					value &= 0x3FE0;
-					if (value & 0x2000) {
-						value |= 0xC000;
-					}
-				}
-				if (value >= 0) {
-					value += context->zero_offset;
-				} else {
-					value -= context->zero_offset;
-				}
-				if (context->channels[i].logfile) {
-					fwrite(&value, sizeof(value), 1, context->channels[i].logfile);
-				}
-				if (context->channels[i].lr & 0x80) {
-					left += (value * context->volume_mult) / context->volume_div;
-				} else if (context->zero_offset) {
-					if (value >= 0) {
-						left += (context->zero_offset * context->volume_mult) / context->volume_div;
-					} else {
-						left -= (context->zero_offset * context->volume_mult) / context->volume_div;
-					}
-				}
-				if (context->channels[i].lr & 0x40) {
-					right += (value * context->volume_mult) / context->volume_div;
-				} else if (context->zero_offset) {
-					if (value >= 0) {
-						right += (context->zero_offset * context->volume_mult) / context->volume_div;
-					} else {
-						right -= (context->zero_offset * context->volume_mult) / context->volume_div;
-					}
-				}
-			}
-			render_put_stereo_sample(context->audio, left, right);
+			ym_output_sample(context);
 		}
 		
-	}
-	if (context->current_cycle >= context->write_cycle + (context->busy_cycles * context->clock_inc / 6)) {
-		context->status &= 0x7F;
-		context->write_cycle = CYCLE_NEVER;
 	}
 	//printf("Done running YM2612 at cycle %d\n", context->current_cycle, to_cycle);
 }
@@ -626,9 +666,6 @@ void ym_address_write_part1(ym2612_context * context, uint8_t address)
 	//printf("address_write_part1: %X\n", address);
 	context->selected_reg = address;
 	context->selected_part = 0;
-	context->write_cycle = context->current_cycle;
-	context->busy_cycles = BUSY_CYCLES_ADDRESS;
-	context->status |= 0x80;
 }
 
 void ym_address_write_part2(ym2612_context * context, uint8_t address)
@@ -636,9 +673,6 @@ void ym_address_write_part2(ym2612_context * context, uint8_t address)
 	//printf("address_write_part2: %X\n", address);
 	context->selected_reg = address;
 	context->selected_part = 1;
-	context->write_cycle = context->current_cycle;
-	context->busy_cycles = BUSY_CYCLES_ADDRESS;
-	context->status |= 0x80;
 }
 
 static uint8_t fnum_to_keycode[] = {
@@ -745,8 +779,32 @@ static uint32_t ym_calc_phase_inc(ym2612_context * context, ym_operator * operat
 	return inc;
 }
 
+void ym_vgm_log(ym2612_context *context, uint32_t master_clock, vgm_writer *vgm)
+{
+	vgm_ym2612_init(vgm, 6 * master_clock / context->clock_inc);
+	context->vgm = vgm;
+	for (uint8_t reg = YM_PART1_START; reg < YM_REG_END; reg++) {
+		if ((reg >= REG_DETUNE_MULT && (reg & 3) == 3) || (reg >= 0x2D && reg < REG_DETUNE_MULT) || reg == 0x23 || reg == 0x29) {
+			//skip invalid registers
+			continue;
+		}
+		vgm_ym2612_part1_write(context->vgm, context->current_cycle, reg, context->part1_regs[reg - YM_PART1_START]);
+	}
+	
+	for (uint8_t reg = YM_PART2_START; reg < YM_REG_END; reg++) {
+		if ((reg & 3) == 3 || (reg >= REG_FNUM_LOW_CH3 && reg < REG_ALG_FEEDBACK)) {
+			//skip invalid registers
+			continue;
+		}
+		vgm_ym2612_part2_write(context->vgm, context->current_cycle, reg, context->part2_regs[reg - YM_PART2_START]);
+	}
+}
+
 void ym_data_write(ym2612_context * context, uint8_t value)
 {
+	context->write_cycle = context->current_cycle;
+	context->busy_start = context->current_cycle + context->clock_inc;
+	
 	if (context->selected_reg >= YM_REG_END) {
 		return;
 	}
@@ -754,10 +812,16 @@ void ym_data_write(ym2612_context * context, uint8_t value)
 		if (context->selected_reg < YM_PART2_START) {
 			return;
 		}
+		if (context->vgm) {
+			vgm_ym2612_part2_write(context->vgm, context->current_cycle, context->selected_reg, value);
+		}
 		context->part2_regs[context->selected_reg - YM_PART2_START] = value;
 	} else {
 		if (context->selected_reg < YM_PART1_START) {
 			return;
+		}
+		if (context->vgm) {
+			vgm_ym2612_part1_write(context->vgm, context->current_cycle, context->selected_reg, value);
 		}
 		context->part1_regs[context->selected_reg - YM_PART1_START] = value;
 	}
@@ -773,7 +837,19 @@ void ym_data_write(ym2612_context * context, uint8_t value)
 			}*/
 			context->lfo_enable = value & 0x8;
 			if (!context->lfo_enable) {
+				uint8_t old_pm_step = context->lfo_pm_step;
 				context->lfo_am_step = context->lfo_pm_step = 0;
+				if (old_pm_step) {
+					for (int chan = 0; chan < NUM_CHANNELS; chan++)
+					{
+						if (context->channels[chan].pms) {
+							for (int op = chan * 4; op < (chan + 1) * 4; op++)
+							{
+								context->operators[op].phase_inc = ym_calc_phase_inc(context, context->operators + op, op);
+							}
+						}
+					}
+				}
 			}
 			context->lfo_freq = value & 0x7;
 
@@ -809,7 +885,14 @@ void ym_data_write(ym2612_context * context, uint8_t value)
 			if (context->ch3_mode == CSM_MODE && (value & 0xC0) != CSM_MODE && context->csm_keyon) {
 				csm_keyoff(context);
 			}
+			uint8_t old_mode = context->ch3_mode;
 			context->ch3_mode = value & 0xC0;
+			if (context->ch3_mode != old_mode) {
+				for (int op = 2 * 4; op < 3*4; op++)
+				{
+					context->operators[op].phase_inc = ym_calc_phase_inc(context, context->operators + op, op);
+				}
+			}
 			break;
 		}
 		case REG_KEY_ONOFF: {
@@ -861,6 +944,7 @@ void ym_data_write(ym2612_context * context, uint8_t value)
 			case REG_DETUNE_MULT:
 				operator->detune = value >> 4 & 0x7;
 				operator->multiple = value & 0xF;
+				operator->phase_inc = ym_calc_phase_inc(context, operator, op);
 				break;
 			case REG_TOTAL_LEVEL:
 				operator->total_level = (value & 0x7F) << 5;
@@ -907,6 +991,10 @@ void ym_data_write(ym2612_context * context, uint8_t value)
 				context->channels[channel].block = context->channels[channel].block_fnum_latch >> 3 & 0x7;
 				context->channels[channel].fnum = (context->channels[channel].block_fnum_latch & 0x7) << 8 | value;
 				context->channels[channel].keycode = context->channels[channel].block << 2 | fnum_to_keycode[context->channels[channel].fnum >> 7];
+				for (int op = channel * 4; op < (channel + 1) * 4; op++)
+				{
+					context->operators[op].phase_inc = ym_calc_phase_inc(context, context->operators + op, op);
+				}
 				break;
 			case REG_BLOCK_FNUM_H:{
 				context->channels[channel].block_fnum_latch = value;
@@ -917,6 +1005,10 @@ void ym_data_write(ym2612_context * context, uint8_t value)
 					context->ch3_supp[channel].block = context->ch3_supp[channel].block_fnum_latch >> 3 & 0x7;
 					context->ch3_supp[channel].fnum = (context->ch3_supp[channel].block_fnum_latch & 0x7) << 8 | value;
 					context->ch3_supp[channel].keycode = context->ch3_supp[channel].block << 2 | fnum_to_keycode[context->ch3_supp[channel].fnum >> 7];
+					if (context->ch3_mode) {
+						int op = 2 * 4 + (channel < 2 ? (channel ^ 1) : channel);
+						context->operators[op].phase_inc = ym_calc_phase_inc(context, context->operators + op, op);
+					}
 				}
 				break;
 			case REG_BLOCK_FN_CH3:
@@ -1042,24 +1134,44 @@ void ym_data_write(ym2612_context * context, uint8_t value)
 				context->channels[channel].feedback = value >> 3 & 0x7;
 				//printf("Algorithm %d, feedback %d for channel %d\n", value & 0x7, value >> 3 & 0x7, channel);
 				break;
-			case REG_LR_AMS_PMS:
+			case REG_LR_AMS_PMS: {
+				uint8_t old_pms = context->channels[channel].pms;
 				context->channels[channel].pms = (value & 0x7) * 32;
 				context->channels[channel].ams = value >> 4 & 0x3;
 				context->channels[channel].lr = value & 0xC0;
+				if (old_pms != context->channels[channel].pms) {
+					for (int op = channel * 4; op < (channel + 1) * 4; op++)
+					{
+						context->operators[op].phase_inc = ym_calc_phase_inc(context, context->operators + op, op);
+					}
+				}
 				//printf("Write of %X to LR_AMS_PMS reg for channel %d\n", value, channel);
 				break;
 			}
+			}
 		}
 	}
-
-	context->write_cycle = context->current_cycle;
-	context->busy_cycles = context->selected_reg < 0xA0 ? BUSY_CYCLES_DATA_LOW : BUSY_CYCLES_DATA_HIGH;
-	context->status |= 0x80;
 }
 
-uint8_t ym_read_status(ym2612_context * context)
+uint8_t ym_read_status(ym2612_context * context, uint32_t cycle, uint32_t port)
 {
-	return context->status;
+	uint8_t status;
+	port &= context->status_address_mask;
+	if (port) {
+		if (context->last_status_cycle != CYCLE_NEVER && cycle - context->last_status_cycle > context->invalid_status_decay) {
+			context->last_status = 0;
+		}
+		status = context->last_status;
+	} else {
+		status = context->status;
+		if (cycle >= context->busy_start && cycle < context->busy_start + context->busy_cycles) {
+			status |= 0x80;
+		}
+		context->last_status = status;
+		context->last_status_cycle = cycle;
+	}
+	return status;
+		
 }
 
 void ym_print_channel_info(ym2612_context *context, int channel)
@@ -1171,7 +1283,10 @@ void ym_serialize(ym2612_context *context, serialize_buffer *buf)
 	save_int8(buf, context->selected_part);
 	save_int32(buf, context->current_cycle);
 	save_int32(buf, context->write_cycle);
-	save_int32(buf, context->busy_cycles);
+	save_int32(buf, context->busy_start);
+	save_int32(buf, context->last_status_cycle);
+	save_int32(buf, context->invalid_status_decay);
+	save_int8(buf, context->last_status);
 }
 
 void ym_deserialize(deserialize_buffer *buf, void *vcontext)
@@ -1246,5 +1361,13 @@ void ym_deserialize(deserialize_buffer *buf, void *vcontext)
 	context->selected_part = load_int8(buf);
 	context->current_cycle = load_int32(buf);
 	context->write_cycle = load_int32(buf);
-	context->busy_cycles = load_int32(buf);
+	context->busy_start = load_int32(buf);
+	if (buf->size > buf->cur_pos) {
+		context->last_status_cycle = load_int32(buf);
+		context->invalid_status_decay = load_int32(buf);
+		context->last_status = load_int8(buf);
+	} else {
+		context->last_status = context->status;
+		context->last_status_cycle = context->write_cycle;
+	}
 }

@@ -11,7 +11,7 @@
 #include "system.h"
 #include "68kinst.h"
 #include "m68k_core.h"
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 #include "z80_to_x86.h"
 #else
 #include "z80.h"
@@ -267,6 +267,7 @@ static char *get_save_dir(system_media *media)
 		savedir_template = "$USERDATA/blastem/$ROMNAME";
 	}
 	tern_node *vars = tern_insert_ptr(NULL, "ROMNAME", media->name);
+	vars = tern_insert_ptr(vars, "ROMDIR", media->dir);
 	vars = tern_insert_ptr(vars, "HOME", get_home_dir());
 	vars = tern_insert_ptr(vars, "EXEDIR", get_exe_dir());
 	vars = tern_insert_ptr(vars, "USERDATA", (char *)get_userdata_dir());
@@ -343,6 +344,11 @@ static void on_drag_drop(const char *filename)
 }
 
 static system_media cart, lock_on;
+const system_media *current_media(void)
+{
+	return &cart;
+}
+
 void reload_media(void)
 {
 	if (!current_system) {
@@ -382,7 +388,7 @@ void init_system_with_media(const char *path, system_type force_stype)
 {
 	if (game_system) {
 		game_system->persist_save(game_system);
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 		//swap to game context arena and mark all allocated pages in it free
 		if (current_system == menu_system) {
 			current_system->arena = set_current_arena(game_system->arena);
@@ -390,7 +396,7 @@ void init_system_with_media(const char *path, system_type force_stype)
 		mark_all_free();
 #endif
 		game_system->free_context(game_system);
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	} else if(current_system) {
 		//start a new arena and save old one in suspended system context
 		current_system->arena = start_new_arena();
@@ -461,7 +467,7 @@ int main(int argc, char ** argv)
 					debug_target = 1;
 				}
 				break;
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 			case 'D':
 				gdb_remote_init();
 				dtype = DEBUGGER_GDB;
@@ -692,7 +698,7 @@ int main(int argc, char ** argv)
 			current_system->enter_debugger = start_in_debugger && menu == debug_target;
 			current_system->start_context(current_system, statefile);
 		} else if (menu && game_system) {
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 			current_system->arena = set_current_arena(game_system->arena);
 #endif
 			current_system = game_system;
@@ -704,7 +710,7 @@ int main(int argc, char ** argv)
 				ui_idle_loop();
 #endif
 			} else {
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 				current_system->arena = set_current_arena(menu_system->arena);
 #endif
 				current_system = menu_system;

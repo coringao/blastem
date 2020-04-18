@@ -116,7 +116,7 @@ ifeq ($(MAKECMDGOALS),libblastem.$(SO))
 LDFLAGS:=-lm
 else
 CFLAGS:=$(shell pkg-config --cflags-only-I $(LIBS)) $(CFLAGS)
-LDFLAGS:=-lm $(shell pkg-config --libs $(LIBS)) $(GLES_LIB)
+LDFLAGS:=-lm $(shell pkg-config --libs $(LIBS))
 ifdef USE_FBDEV
 LDFLAGS+= -pthread
 endif
@@ -179,26 +179,26 @@ CPU:=i686
 endif
 endif
 
-ifdef USE_NATIVE
 TRANSOBJS=gen.o backend.o $(MEM) arena.o tern.o
-M68KOBJS=68kinst.o m68k_core.o
+M68KOBJS=68kinst.o
+
+ifdef NEW_CORE
+Z80OBJS=z80.o z80inst.o 
+M68KOBJS+= m68k_core.o musashi/m68kops.o musashi/m68kcpu.o
+CFLAGS+= -DNEW_CORE
+else
 Z80OBJS=z80inst.o z80_to_x86.o
 ifeq ($(CPU),x86_64)
-M68KOBJS+= m68k_core_x86.o
+M68KOBJS+= m68k_core.o m68k_core_x86.o
 TRANSOBJS+= gen_x86.o backend_x86.o
 else
 ifeq ($(CPU),i686)
-M68KOBJS+= m68k_core_x86.o
+M68KOBJS+= m68k_core.o m68k_core_x86.o
 TRANSOBJS+= gen_x86.o backend_x86.o
 endif
 endif
-CFLAGS+= -DUSE_NATIVE
-else
-Z80OBJS=z80.o z80inst.o
-TRANSOBJS=backend.o tern.o
-M68KOBJS=68kinst.o m68k_core.o musashi/m68kops.o musashi/m68kcpu.o
 endif
-AUDIOOBJS=ym2612.o psg.o wave.o
+AUDIOOBJS=ym2612.o psg.o wave.o vgm.o render_audio.o
 CONFIGOBJS=config.o tern.o util.o paths.o 
 NUKLEAROBJS=$(FONT) nuklear_ui/blastem_nuklear.o nuklear_ui/sfnt.o
 RENDEROBJS=ppm.o controller_info.o
@@ -308,7 +308,7 @@ ztestrun : ztestrun.o serialize.o $(Z80OBJS) $(TRANSOBJS)
 ztestgen : ztestgen.o z80inst.o
 	$(CC) -ggdb -o ztestgen ztestgen.o z80inst.o
 
-stateview$(EXE) : stateview.o vdp.o $(RENDEROBJS) serialize.o $(CONFIGOBJS) gst.o
+stateview$(EXE) : stateview.o vdp.o $(RENDEROBJS) serialize.o $(CONFIGOBJS) gst.o render_audio.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 	$(FIXUP) ./$@
 
@@ -342,6 +342,9 @@ offsets : offsets.c z80_to_x86.h m68k_core.h
 
 vos_prog_info : vos_prog_info.o vos_program_module.o
 	$(CC) -o vos_prog_info vos_prog_info.o vos_program_module.o
+	
+m68k.c : m68k.cpu cpu_dsl.py
+	./cpu_dsl.py -d call $< > $@
 	
 %.c : %.cpu cpu_dsl.py
 	./cpu_dsl.py -d goto $< > $@

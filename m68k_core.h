@@ -36,13 +36,13 @@ typedef struct {
 
 typedef struct {
 	cpu_options     gen;
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	int8_t          dregs[8];
 	int8_t          aregs[8];
 	int8_t			flag_regs[5];
 #endif
 	FILE            *address_log;
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 	code_ptr        read_16;
 	code_ptr        write_16;
 	code_ptr        read_8;
@@ -119,7 +119,7 @@ uint32_t get_instruction_start(m68k_options *opts, uint32_t address);
 uint16_t m68k_get_ir(m68k_context *context);
 void m68k_print_regs(m68k_context * context);
 void m68k_invalidate_code_range(m68k_context *context, uint32_t start, uint32_t end);
-#ifdef USE_NATIVE
+#ifndef NEW_CORE
 m68k_context * m68k_handle_code_write(uint32_t address, m68k_context * context);
 #else
 #define m68k_handle_code_write(A, M)
