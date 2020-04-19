@@ -1210,11 +1210,11 @@ void start_68k_context(m68k_context * context, uint32_t address)
 
 void resume_68k(m68k_context *context)
 {
+	context->should_return = 0;
 #ifndef NEW_CORE
 	code_ptr addr = context->resume_pc;
 	context->resume_pc = NULL;
 	m68k_options * options = context->options;
-	context->should_return = 0;
 	options->start_context(addr, context);
 #else
 	start_68k_context(context, 0);
