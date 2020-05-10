@@ -19,6 +19,7 @@
 #include "bindings.h"
 #include "jcart.h"
 #include "config.h"
+#include "event_log.h"
 #define MCLKS_NTSC 53693175
 #define MCLKS_PAL  53203395
 
@@ -50,15 +51,17 @@ uint32_t MCLKS_PER_68K;
 #define Z80_OPTS options
 #endif
 
-void genesis_serialize(genesis_context *gen, serialize_buffer *buf, uint32_t m68k_pc)
+void genesis_serialize(genesis_context *gen, serialize_buffer *buf, uint32_t m68k_pc, uint8_t all)
 {
-	start_section(buf, SECTION_68000);
-	m68k_serialize(gen->m68k, m68k_pc, buf);
-	end_section(buf);
-	
-	start_section(buf, SECTION_Z80);
-	z80_serialize(gen->z80, buf);
-	end_section(buf);
+	if (all) {
+		start_section(buf, SECTION_68000);
+		m68k_serialize(gen->m68k, m68k_pc, buf);
+		end_section(buf);
+		
+		start_section(buf, SECTION_Z80);
+		z80_serialize(gen->z80, buf);
+		end_section(buf);
+	}
 	
 	start_section(buf, SECTION_VDP);
 	vdp_serialize(gen->vdp, buf);
@@ -72,35 +75,37 @@ void genesis_serialize(genesis_context *gen, serialize_buffer *buf, uint32_t m68
 	psg_serialize(gen->psg, buf);
 	end_section(buf);
 	
-	start_section(buf, SECTION_GEN_BUS_ARBITER);
-	save_int8(buf, gen->z80->reset);
-	save_int8(buf, gen->z80->busreq);
-	save_int16(buf, gen->z80_bank_reg);
-	end_section(buf);
-	
-	start_section(buf, SECTION_SEGA_IO_1);
-	io_serialize(gen->io.ports, buf);
-	end_section(buf);
-	
-	start_section(buf, SECTION_SEGA_IO_2);
-	io_serialize(gen->io.ports + 1, buf);
-	end_section(buf);
-	
-	start_section(buf, SECTION_SEGA_IO_EXT);
-	io_serialize(gen->io.ports + 2, buf);
-	end_section(buf);
-	
-	start_section(buf, SECTION_MAIN_RAM);
-	save_int8(buf, RAM_WORDS * 2 / 1024);
-	save_buffer16(buf, gen->work_ram, RAM_WORDS);
-	end_section(buf);
-	
-	start_section(buf, SECTION_SOUND_RAM);
-	save_int8(buf, Z80_RAM_BYTES / 1024);
-	save_buffer8(buf, gen->zram, Z80_RAM_BYTES);
-	end_section(buf);
-	
-	cart_serialize(&gen->header, buf);
+	if (all) {
+		start_section(buf, SECTION_GEN_BUS_ARBITER);
+		save_int8(buf, gen->z80->reset);
+		save_int8(buf, gen->z80->busreq);
+		save_int16(buf, gen->z80_bank_reg);
+		end_section(buf);
+		
+		start_section(buf, SECTION_SEGA_IO_1);
+		io_serialize(gen->io.ports, buf);
+		end_section(buf);
+		
+		start_section(buf, SECTION_SEGA_IO_2);
+		io_serialize(gen->io.ports + 1, buf);
+		end_section(buf);
+		
+		start_section(buf, SECTION_SEGA_IO_EXT);
+		io_serialize(gen->io.ports + 2, buf);
+		end_section(buf);
+		
+		start_section(buf, SECTION_MAIN_RAM);
+		save_int8(buf, RAM_WORDS * 2 / 1024);
+		save_buffer16(buf, gen->work_ram, RAM_WORDS);
+		end_section(buf);
+		
+		start_section(buf, SECTION_SOUND_RAM);
+		save_int8(buf, Z80_RAM_BYTES / 1024);
+		save_buffer8(buf, gen->zram, Z80_RAM_BYTES);
+		end_section(buf);
+		
+		cart_serialize(&gen->header, buf);
+	}
 }
 
 static uint8_t *serialize(system_header *sys, size_t *size_out)
@@ -120,7 +125,7 @@ static uint8_t *serialize(system_header *sys, size_t *size_out)
 		init_serialize(&state);
 		uint32_t address = read_word(4, (void **)gen->m68k->mem_pointers, &gen->m68k->options->gen, gen->m68k) << 16;
 		address |= read_word(6, (void **)gen->m68k->mem_pointers, &gen->m68k->options->gen, gen->m68k);
-		genesis_serialize(gen, &state, address);
+		genesis_serialize(gen, &state, address, 1);
 		if (size_out) {
 			*size_out = state.size;
 		}
@@ -351,9 +356,6 @@ static void sync_sound(genesis_context * gen, uint32_t target)
 	//printf("Target: %d, YM bufferpos: %d, PSG bufferpos: %d\n", target, gen->ym->buffer_pos, gen->psg->buffer_pos * 2);
 }
 
-//TODO: move this inside the system context
-static uint32_t last_frame_num;
-
 //My refresh emulation isn't currently good enough and causes more problems than it solves
 #define REFRESH_EMULATION
 #ifdef REFRESH_EMULATION
@@ -392,9 +394,11 @@ m68k_context * sync_components(m68k_context * context, uint32_t address)
 		context->should_return = 1;
 		gen->reset_cycle = CYCLE_NEVER;
 	}
-	if (v_context->frame != last_frame_num) {
-		//printf("reached frame end %d | MCLK Cycles: %d, Target: %d, VDP cycles: %d, vcounter: %d, hslot: %d\n", last_frame_num, mclks, gen->frame_end, v_context->cycles, v_context->vcounter, v_context->hslot);
-		last_frame_num = v_context->frame;
+	if (v_context->frame != gen->last_frame) {
+		//printf("reached frame end %d | MCLK Cycles: %d, Target: %d, VDP cycles: %d, vcounter: %d, hslot: %d\n", gen->last_frame, mclks, gen->frame_end, v_context->cycles, v_context->vcounter, v_context->hslot);
+		gen->last_frame = v_context->frame;
+		event_flush(mclks);
+		gen->last_flush_cycle = mclks;
 
 		if(exit_after){
 			--exit_after;
@@ -421,7 +425,12 @@ m68k_context * sync_components(m68k_context * context, uint32_t address)
 			if (gen->reset_cycle != CYCLE_NEVER) {
 				gen->reset_cycle -= deduction;
 			}
+			event_cycle_adjust(mclks, deduction);
+			gen->last_flush_cycle -= deduction;
 		}
+	} else if (mclks - gen->last_flush_cycle > gen->soft_flush_cycles) {
+		event_soft_flush(mclks);
+		gen->last_flush_cycle = mclks;
 	}
 	gen->frame_end = vdp_cycles_to_frame_end(v_context);
 	context->sync_cycle = gen->frame_end;
@@ -461,9 +470,9 @@ m68k_context * sync_components(m68k_context * context, uint32_t address)
 				}
 			}
 #endif
-			char *save_path = slot == SERIALIZE_SLOT ? NULL : get_slot_name(&gen->header, slot, use_native_states ? "state" : "gst");
+			char *save_path = slot >= SERIALIZE_SLOT ? NULL : get_slot_name(&gen->header, slot, use_native_states ? "state" : "gst");
 #ifndef NEW_CORE
-			if (use_native_states || slot == SERIALIZE_SLOT) {
+			if (use_native_states || slot >= SERIALIZE_SLOT) {
 #endif
 				serialize_buffer state;
 				init_serialize(&state);
@@ -473,6 +482,8 @@ m68k_context * sync_components(m68k_context * context, uint32_t address)
 					gen->serialize_size = state.size;
 					context->sync_cycle = context->current_cycle;
 					context->should_return = 1;
+				} else if (slot == EVENTLOG_SLOT) {
+					event_state(context->current_cycle, &state);
 				} else {
 					save_to_file(&state, save_path);
 					free(state.data);
@@ -482,7 +493,9 @@ m68k_context * sync_components(m68k_context * context, uint32_t address)
 				save_gst(gen, save_path, address);
 			}
 #endif
-			printf("Saved state to %s\n", save_path);
+			if (slot != SERIALIZE_SLOT) {
+				debug_message("Saved state to %s\n", save_path);
+			}
 			free(save_path);
 		} else if(gen->header.save_state) {
 			context->sync_cycle = context->current_cycle + 1;
@@ -644,11 +657,11 @@ static uint16_t vdp_port_read(uint32_t vdp_port, m68k_context * context)
 	uint16_t value;
 #ifdef REFRESH_EMULATION
 	if (context->current_cycle - 4*MCLKS_PER_68K > last_sync_cycle) {
-		//do refresh check here so we can avoid adding a penalty for a refresh that happens during a VDP access
-		refresh_counter += context->current_cycle - 4*MCLKS_PER_68K - last_sync_cycle;
-		context->current_cycle += REFRESH_DELAY * MCLKS_PER_68K * (refresh_counter / (MCLKS_PER_68K * REFRESH_INTERVAL));
-		refresh_counter = refresh_counter % (MCLKS_PER_68K * REFRESH_INTERVAL);
-		last_sync_cycle = context->current_cycle;
+	//do refresh check here so we can avoid adding a penalty for a refresh that happens during a VDP access
+	refresh_counter += context->current_cycle - 4*MCLKS_PER_68K - last_sync_cycle;
+	context->current_cycle += REFRESH_DELAY * MCLKS_PER_68K * (refresh_counter / (MCLKS_PER_68K * REFRESH_INTERVAL));
+	refresh_counter = refresh_counter % (MCLKS_PER_68K * REFRESH_INTERVAL);
+	last_sync_cycle = context->current_cycle;
 	}
 #endif
 	genesis_context *gen = context->system;
@@ -1198,8 +1211,10 @@ void set_region(genesis_context *gen, rom_info *info, uint8_t region)
 	
 	if (region & HZ50) {
 		gen->normal_clock = MCLKS_PAL;
+		gen->soft_flush_cycles = MCLKS_LINE * 262 / 3 + 2;
 	} else {
 		gen->normal_clock = MCLKS_NTSC;
+		gen->soft_flush_cycles = MCLKS_LINE * 313 / 3 + 2;
 	}
 	gen->master_clock = gen->normal_clock;
 }
@@ -1265,7 +1280,7 @@ static void handle_reset_requests(genesis_context *gen)
 			resume_68k(gen->m68k);
 		}
 	}
-	if (render_should_release_on_exit()) {
+	if (gen->header.force_release || render_should_release_on_exit()) {
 		bindings_release_capture();
 		vdp_release_framebuffer(gen->vdp);
 		render_pause_source(gen->ym->audio);
@@ -1321,7 +1336,8 @@ static void start_genesis(system_header *system, char *statefile)
 static void resume_genesis(system_header *system)
 {
 	genesis_context *gen = (genesis_context *)system;
-	if (render_should_release_on_exit()) {
+	if (gen->header.force_release || render_should_release_on_exit()) {
+		gen->header.force_release = 0;
 		render_set_video_standard((gen->version_reg & HZ50) ? VID_PAL : VID_NTSC);
 		bindings_reacquire_capture();
 		vdp_reacquire_framebuffer(gen->vdp);
@@ -1565,8 +1581,13 @@ genesis_context *alloc_init_genesis(rom_info *rom, void *main_rom, void *lock_on
 	gen->int_latency_prev2 = MCLKS_PER_68K * 16;
 	
 	render_set_video_standard((gen->version_reg & HZ50) ? VID_PAL : VID_NTSC);
+	event_system_start(SYSTEM_GENESIS, (gen->version_reg & HZ50) ? VID_PAL : VID_NTSC, rom->name);
 	
 	gen->ym = malloc(sizeof(ym2612_context));
+	char *fm = tern_find_ptr_default(model, "fm", "discrete 2612");
+	if (!strcmp(fm + strlen(fm) -4, "3834")) {
+		system_opts |= YM_OPT_3834;
+	}
 	ym_init(gen->ym, gen->master_clock, MCLKS_PER_YM, system_opts);
 
 	gen->psg = malloc(sizeof(psg_context));
@@ -1676,6 +1697,7 @@ genesis_context *alloc_init_genesis(rom_info *rom, void *main_rom, void *lock_on
 			gen->bank_regs[i] = i;
 		}
 	}
+	gen->reset_cycle = CYCLE_NEVER;
 
 	return gen;
 }

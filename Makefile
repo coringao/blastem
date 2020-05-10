@@ -31,7 +31,7 @@ SDL2_PREFIX:="sdl/x86_64-w64-mingw32"
 GLUDIR:=x64
 endif
 GLEW32S_LIB:=$(GLEW_PREFIX)/lib/Release/$(GLUDIR)/glew32s.lib
-CFLAGS:=-std=gnu99 -Wreturn-type -Werror=return-type -Werror=implicit-function-declaration
+CFLAGS:=-std=gnu99 -Wreturn-type -Werror=return-type -Werror=implicit-function-declaration -Wpointer-arith -Werror=pointer-arith
 LDFLAGS:=-lm -lmingw32 -lws2_32 -mwindows
 ifneq ($(MAKECMDGOALS),libblastem.dll)
 CFLAGS+= -I"$(SDL2_PREFIX)/include/SDL2" -I"$(GLEW_PREFIX)/include" -DGLEW_STATIC
@@ -47,7 +47,7 @@ NET:=net.o
 EXE:=
 
 HAS_PROC:=$(shell if [ -d /proc ]; then /bin/echo -e -DHAS_PROC; fi)
-CFLAGS:=-std=gnu99 -Wreturn-type -Werror=return-type -Werror=implicit-function-declaration -Wno-unused-value $(HAS_PROC) -DHAVE_UNISTD_H
+CFLAGS:=-std=gnu99 -Wreturn-type -Werror=return-type -Werror=implicit-function-declaration -Wno-unused-value  -Wpointer-arith -Werror=pointer-arith $(HAS_PROC) -DHAVE_UNISTD_H
 
 ifeq ($(OS),Darwin)
 LIBS=sdl2 glew
@@ -199,7 +199,7 @@ TRANSOBJS+= gen_x86.o backend_x86.o
 endif
 endif
 endif
-AUDIOOBJS=ym2612.o psg.o wave.o vgm.o render_audio.o
+AUDIOOBJS=ym2612.o psg.o wave.o vgm.o event_log.o render_audio.o
 CONFIGOBJS=config.o tern.o util.o paths.o 
 NUKLEAROBJS=$(FONT) nuklear_ui/blastem_nuklear.o nuklear_ui/sfnt.o
 RENDEROBJS=ppm.o controller_info.o
@@ -217,8 +217,8 @@ endif
 
 #MAINOBJS=blastem.o system.o genesis.o debug.o gdb_remote.o vdp.o $(RENDEROBJS) io.o romdb.o hash.o menu.o xband.o 
 MAINOBJS=blastem.o system.o genesis.o vdp.o $(RENDEROBJS) io.o romdb.o hash.o menu.o xband.o \
-	realtec.o i2c.o nor.o sega_mapper.o multi_game.o megawifi.o $(NET) serialize.o $(TERMINAL) $(CONFIGOBJS) \
-	$(M68KOBJS) $(TRANSOBJS) $(AUDIOOBJS) saves.o zip.o bindings.o jcart.o
+	realtec.o i2c.o nor.o sega_mapper.o multi_game.o megawifi.o $(NET) serialize.o $(TERMINAL) $(CONFIGOBJS) gst.o \
+	$(M68KOBJS) $(TRANSOBJS) $(AUDIOOBJS) saves.o zip.o bindings.o jcart.o gen_player.o
 
 LIBOBJS=libblastem.o system.o genesis.o debug.o gdb_remote.o vdp.o io.o romdb.o hash.o xband.o realtec.o \
 	i2c.o nor.o sega_mapper.o multi_game.o megawifi.o $(NET) serialize.o $(TERMINAL) $(CONFIGOBJS) gst.o \
@@ -265,7 +265,7 @@ ifdef FONT_PATH
 CFLAGS+= -DFONT_PATH='"'$(FONT_PATH)'"'
 endif
 
-ALL=dis$(EXE) zdis$(EXE) stateview$(EXE) vgmplay$(EXE) blastem$(EXE)
+ALL=dis$(EXE) zdis$(EXE) vgmplay$(EXE) blastem$(EXE)
 ifneq ($(OS),Windows)
 ALL+= termhelper
 endif
@@ -313,10 +313,6 @@ ztestrun : ztestrun.o serialize.o $(Z80OBJS) $(TRANSOBJS)
 ztestgen : ztestgen.o z80inst.o
 	$(CC) -ggdb -o ztestgen ztestgen.o z80inst.o
 
-stateview$(EXE) : stateview.o vdp.o $(RENDEROBJS) serialize.o $(CONFIGOBJS) gst.o render_audio.o
-	$(CC) -o $@ $^ $(LDFLAGS)
-	$(FIXUP) ./$@
-
 vgmplay$(EXE) : vgmplay.o $(RENDEROBJS) serialize.o $(CONFIGOBJS) $(AUDIOOBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 	$(FIXUP) ./$@
@@ -350,7 +346,7 @@ vos_prog_info : vos_prog_info.o vos_program_module.o
 	
 m68k.c : m68k.cpu cpu_dsl.py
 	./cpu_dsl.py -d call $< > $@
-	
+
 %.c : %.cpu cpu_dsl.py
 	./cpu_dsl.py -d goto $< > $@
 

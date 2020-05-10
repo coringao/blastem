@@ -65,6 +65,7 @@
 #define RENDER_DPAD_LEFT   SDL_HAT_LEFT
 #define RENDER_DPAD_RIGHT  SDL_HAT_RIGHT
 #define render_relative_mouse SDL_SetRelativeMouseMode
+typedef SDL_Thread* render_thread;
 #endif
 #endif
 
@@ -76,8 +77,6 @@
 #define FRAMEBUFFER_EVEN 1
 #define FRAMEBUFFER_UI 2
 #define FRAMEBUFFER_USER_START 3
-
-#include "vdp.h"
 
 typedef enum {
 	VID_NTSC,
@@ -95,6 +94,7 @@ typedef enum {
 typedef void (*drop_handler)(const char *filename);
 typedef void (*window_close_handler)(uint8_t which);
 typedef void (*ui_render_fun)(void);
+typedef int (*render_thread_fun)(void*);
 
 uint32_t render_map_color(uint8_t r, uint8_t g, uint8_t b);
 void render_save_screenshot(char *path);
@@ -137,6 +137,8 @@ void render_set_ui_render_fun(ui_render_fun);
 void render_set_ui_fb_resize_handler(ui_render_fun resize);
 void render_video_loop(void);
 uint8_t render_should_release_on_exit(void);
+void render_set_external_sync(uint8_t ext_sync_on);
+uint8_t render_create_thread(render_thread *thread, const char *name, render_thread_fun fun, void *data);
 
 #endif //RENDER_H_
 
