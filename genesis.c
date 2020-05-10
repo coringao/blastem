@@ -476,7 +476,7 @@ m68k_context * sync_components(m68k_context * context, uint32_t address)
 #endif
 				serialize_buffer state;
 				init_serialize(&state);
-				genesis_serialize(gen, &state, address);
+				genesis_serialize(gen, &state, address, slot != EVENTLOG_SLOT);
 				if (slot == SERIALIZE_SLOT) {
 					gen->serialize_tmp = state.data;
 					gen->serialize_size = state.size;
